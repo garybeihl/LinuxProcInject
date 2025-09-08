@@ -9,6 +9,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "UefiDriver", "UefiDriver\Ue
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FtdiUsbSerialDxe", "FtdiUsbSerialDxe\FtdiUsbSerialDxe.vcxproj", "{DF325AB7-67A6-473E-93FF-16955AFBC064}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ProcInject", "ProcInject\ProcInject.vcxproj", "{79D431BF-3A96-4AA3-A75C-953C3362E5C2}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Release|x64 = Release|x64
@@ -20,6 +22,8 @@ Global
 		{DF325AB7-67A6-473E-93FF-16955AFBC063}.Release|x64.Build.0 = Release|x64
 		{DF325AB7-67A6-473E-93FF-16955AFBC064}.Release|x64.ActiveCfg = Release|x64
 		{DF325AB7-67A6-473E-93FF-16955AFBC064}.Release|x64.Build.0 = Release|x64
+		{79D431BF-3A96-4AA3-A75C-953C3362E5C2}.Release|x64.ActiveCfg = Release|x64
+		{79D431BF-3A96-4AA3-A75C-953C3362E5C2}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
