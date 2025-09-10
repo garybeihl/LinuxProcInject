@@ -72,37 +72,64 @@ UINT8 printk_banner_template[] = {
 };
 
 UINT8 proc_template[] = {
+	// thread_name:
+	    0x3c, 0x55, 0x45, 0x46, 0x49, 0x3e, 0x00, // "<UEFI>"
+	// code starts here:
 	    0x57, // push rdi
 	// loop1:
-		0x48, 0xBF, 0x60, 0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rdi, 86400 (1 day)
-		0xe8, 0x00, 0x00, 0x00, 0x00, // call ssleep(86400)
-		0xe9, 0xEC, 0xFF, 0xFF, 0xFF, // jmp loop1
+		0x48, 0xc7, 0xc7, 0x00, 0x5c, 0x26, 0x05,  // mov rdi, 86400*1000 (1 day)
+		0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, msleep
+        0xFF, 0xD0,                                // call msleep(86400*1000)
+		0xe9, 0xE8, 0xFF, 0xFF, 0xFF,              // jmp loop1
 		0x5f, // pop rdi
 		0x48, 0x31, 0xc0, // xor rax,rax
 		0xc3  // ret
-};
+}; // 37 (0x25) bytes
 
 UINT8 patch_code_2[] = {
-	0x57, // push rdi
-	// ...TODO: Code to allocate new kernel thread goes here
-	// tfunc = __kmalloc(sizeof(proc_template), GPF_KERNEL | GPF_ZERO = 0x400CC0
-	// <Copy proc_template into tfunc space, fixing up call to ssleep>
-	// task = kthread_create_on_node(tfunc, 0, -1, "<UEFI>"); 
-	// wakeup_process(task); // TODO: check task pointer for error
-	//
+	// Code to allocate new kernel thread goes here
+/* 0*/	0x57, // push rdi
+/* 1*/	0x56, // push rsi
+/* 2*/	0x51, // push rcx
+/* 3*/	0x52, // push rdx
+	// thread_func = __kmalloc(sizeof(proc_template), GPF_KERNEL | GPF_ZERO = 0x400CC0
+/* 4*/	0x48, 0xC7, 0xC7, 0x25, 0x00, 0x00, 0x00, // mov rdi, 0x25 (sizeof proc_template)
+/* b*/	0x48, 0xC7, 0xC6, 0xC0, 0x0C, 0x40, 0x00, // mov rsi 0x400CC0 (GPF_KERNEL | GPF_ZERO)
+/*12*/	0xe8, 0x00, 0x00, 0x00, 0x00,             // call __kmalloc(sizeof(proc_template), GPF_KERNEL | GPF_ZERO)  
+	// Copy proc_template into new thread code space, including already fixed-up call to msleep
+/*17*/	0x48, 0x89, 0xc7,                         // mov rdi, rax
+/*1a*/	0x48, 0x8D, 0x35, 0xBA, 0xFF, 0xFF, 0xFF, // lea rsi, [rip-70] ; start of proc_template
+/*21*/	0xFC,                                     // cld
+/*22*/	0xB9, 0x25, 0x00, 0x00, 0x00,             // mov ecx, 0x25 ; sizeof(proc_template)
+/*27*/	0xF3, 0xA4,                               // rep movsb
+	// task = kthread_create_on_node(tfunc, 0, -1, "<UEFI>");
+/*29*/	0x48, 0x89, 0xc7,                         // mov rdi, rax
+/*2c*/  0x48, 0x83, 0xC7, 0x07,                   // add rdi, 7 (point to the start of the code)
+/*30*/	0x48, 0x31, 0xF6,                         // xor rsi, rsi (rsi = 0)
+/*33*/	0x48, 0x31, 0xD2,                         // xor rdx, rdx (rdx = 0)
+/*36*/	0x48, 0xF7, 0xD2,                         // not rdx (rdx = -1)
+/*39*/	0x48, 0x89, 0xC1,                         // mov rcx, rax ("<UEFI>")
+/*3c*/	0xe8, 0x00, 0x00, 0x00, 0x00,             // call kthread_create_on_node
+
+	0x5a, // pop rdx
+	0x59, // pop rcx
+	0x5e, // pop rsi
 	0x5f, // pop rdi
 	0xe8, 0x00, 0x00, 0x00, 0x00, // call complete(&kthreadd_done)
 	0xe9, 0x00, 0x00, 0x00, 0x00  // jmp back into rest_init() code
 };
 
 UINT8 StrBuffer[256]; // For debug messages
-UINT8* printk;        // Address of the printk routine in linux boot
-UINT8 banner[] = "\001\063ProcInject v0.6\n";
+UINT8* printk;        // Address of the printk routine in linux kernel
+UINT8* __kmalloc;     // Address of the __kmalloc routine in linux kernel
+UINT8* msleep;        // Address of the msleep routine in linux kernel
+UINT8* kthread_create_on_node; // Address of the kthread_create_on_node routine in linux kernel
+UINT8  banner[] = "\001\063ProcInject v0.7\n";
 UINT8* destptr;
 UINT8* arch_call_rest_init = NULL;
 UINT8* rest_init = NULL;
 UINT8* complete = NULL;
-UINT8* patch_point_2;
+UINT8* return_from_patch;
 UINT8* patch_2;
 EFI_EVENT mVirtMemEvt;
 
@@ -175,7 +202,12 @@ VirtMemCallback(
 		SerialOutString(StrBuffer);
 		offset = *(INT32*)(eevm_retaddr + 0x10);
 		printk = (eevm_retaddr + 0x14) + offset;
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Offset = 0x%lx, printk = 0x%llx, retaddr_index = 0x%x\n", offset, printk, retaddr_index);
+		__kmalloc = (UINT8*)((UINT64)printk - 0x8b8986); // System.map tells us this
+		msleep = (UINT8*)((UINT64)printk - 0xa5f1e6);    // System.map tells us this
+		kthread_create_on_node = (UINT8*)((UINT64)printk - 0xad5e66); // System.map tells us this
+		cp = &proc_template[17];
+		*(UINT64*)cp = (UINT64)msleep; // fixup the msleep call in our kthread code
+		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Offset = 0x%lx, printk = 0x%llx, __kmalloc = 0x%llx, msleep = 0x%llx, retaddr_index = 0x%x\n", offset, printk, __kmalloc, msleep, retaddr_index);
 		SerialOutString(StrBuffer);
 	}
 	else {
@@ -305,15 +337,16 @@ VirtMemCallback(
 	// Patched code looks like this:
     //    0xffffffffa4ff7e13:  mov    rdi,0xffffffffa667e8e0           # &kthreadd_done
 	//    0xffffffffa4ff7e1a:  mov    DWORD PTR[rip + 0x1563a20], 0x1  # system_state = SCHEDULING
-	//	  0xffffffffa4ff7e24:  jmp    patch_point_2                    # patch_point_2 code below
+	//	  0xffffffffa4ff7e24:  jmp    patch_2                          # patch_2 code below
+	//     return_from_patch:
 	//	  0xffffffffa4ff7e29 : call   0xffffffffa50013c0               # schedule_preempt_disabled() - goes multi-thread here 
 	//	  0xffffffffa4ff7e2e : mov    edi, 0xe1                        # CPUHP_ONLINE
 	//	  0xffffffffa4ff7e33 : call   0xffffffffa44e87e0               # cpu_startup_entry(CPUHP_ONLINE)   
 	//	  0xffffffffa4ff7e38 : pop    rbp
 	//    0xffffffffa4ff7e39:  ret
 	//
-	//  Where patch_point_2 looks like this:
-	//    patch_point_2:
+	//  Where patch_2 looks like this:
+	//    patch_2:
 	//             push rdi                               # save &kthreadd_done
 	//             ...<allocate new UEFI kernel thread>
 	//             pop  rdi                               # restore &kthreadd_done
@@ -325,7 +358,7 @@ VirtMemCallback(
 		// Something not right, this should be a call insn
 		return;
 	}
-	patch_point_2 = cp;
+	return_from_patch = cp;
 	cp++; // Point to offset
 	offset = *(INT32*)cp;
 	complete = (cp + 4) + offset;
@@ -337,23 +370,35 @@ VirtMemCallback(
 	// functionality since all that code has already run, it only runs once per boot, and will be reclaimed
 	// once the system goes multi-threaded.
 	// 
+
+    // First, write the proc_template that our patch code will be using
+	// This goes immediately prior to the patch_2 kthread allocation code
+	cp = start_kernel_retaddr - (sizeof(patch_code_2) + sizeof(proc_template));
+	for (i = 0; i < sizeof(proc_template); i++) {
+		*cp++ = proc_template[i];
+	}
+
+	//
+	// Next write the new code to allocate our kthread to patch_2
+	//
 	patch_2 = start_kernel_retaddr - sizeof(patch_code_2);
-	//
-	// First write the new code to patch_2
-	//
 	cp = patch_2;
 	for (i = 0; i < sizeof(patch_code_2); i++) {
 		*cp++ = patch_code_2[i];
 	}
 
-	cp = patch_2 + 3; // Fixup call to complete
+	cp = patch_2 + 0x13; // Fixup call to __kmalloc
+	PUT_FIXUP(cp, __kmalloc);
+	cp = patch_2 + 0x3d; // Fixup call to kthread_create_on_node
+	PUT_FIXUP(cp, kthread_create_on_node);
+	cp = patch_2 + (sizeof(patch_code_2) - 9); // Fixup call to complete
 	PUT_FIXUP(cp, complete);
-	cp = patch_2 + 8; // Fixup the jump back into rest_init()
-	PUT_FIXUP(cp, (patch_point_2 + 5));
+	cp = patch_2 + (sizeof(patch_code_2) - 4); // Fixup the jump back into rest_init()
+	PUT_FIXUP(cp, (return_from_patch + 5));
 
 
-	// Next, patch the rest_init() code with a jmp to patch_point_2.
-	cp = patch_point_2;
+	// Next, patch the rest_init() code with a jmp to return_from_patch.
+	cp = return_from_patch;
 	*cp = 0xe9; // direct near jmp to patch_2
 	cp++; // point to offset
 	PUT_FIXUP(cp, patch_2);
