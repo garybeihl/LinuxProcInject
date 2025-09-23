@@ -12,7 +12,7 @@ This project is based on a fork of Alex Ionescu's VisualUefi repo at  https://gi
 
 SetVirtualAddressMap callbacks are executed during OS boot, after ExitBootServices has been called and UEFI DXE memory freed. The intended purpose of SetVirtualAddressMap is to allow UEFI runtime services to adjust their addresses from physical to virtual since the CPU is transitioning to virtual address mode.
 
-In the context of Ubuntu Linux boot, the routine that triggers the UEFI SetVirtualAddressMap callbacks is efi_enter_virtual_mode, which is called about 3/4 of the way through ```start_kernel``` in ```init/main.c```.
+In the context of Ubuntu Linux boot, the routine that triggers the UEFI SetVirtualAddressMap callbacks is ```efi_enter_virtual_mode```, which is called about 3/4 of the way through ```start_kernel``` in ```init/main.c```.
 
 As ProcInject SVAM callack executes, it examines the call stack in memory searching for a return address that points to code similar to the known ```efi_enter_virtual_mode``` code:
 
@@ -29,7 +29,7 @@ status = efi_call_phys(__va(runtime->set_virtual_address_map),
 	}
 ```
 
-The corresponding X86_64 assembler for the return address code resembles the following; exact addresses may vary due to Kernal Address Space Layout Randomization (KASLR).
+The corresponding X86_64 assembler for the return address code resembles the following; exact addresses may vary due to Kernel Address Space Layout Randomization (KASLR).
 
 ```asm
     0xffffffffXXXeb9b1:  mov    ecx,ebp
