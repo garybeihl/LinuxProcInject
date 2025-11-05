@@ -5,6 +5,13 @@
 #include <Library/DebugLib.h>
 
 //
+// Compatibility: Define UNREFERENCED_PARAMETER if not provided by UEFI headers
+//
+#ifndef UNREFERENCED_PARAMETER
+#define UNREFERENCED_PARAMETER(x) (VOID)(x)
+#endif
+
+//
 // Kernel offset configuration table
 // Add new kernel versions here as they are validated
 //

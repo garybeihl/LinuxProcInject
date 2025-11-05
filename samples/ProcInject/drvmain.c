@@ -5,6 +5,13 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeLib.h>
 
+//
+// Compatibility: Define UNREFERENCED_PARAMETER if not provided by UEFI headers
+//
+#ifndef UNREFERENCED_PARAMETER
+#define UNREFERENCED_PARAMETER(x) (VOID)(x)
+#endif
+
 UINT64 *
 AsmGetRsp(VOID);
 
@@ -132,7 +139,7 @@ EFI_EVENT mVirtMemEvt;
 //
 #define PUT_FIXUP(cp, addr) do { \
     INT64 FullOffset = (INT64)((UINT64)(addr) - ((UINT64)(cp) + 4)); \
-    if (FullOffset > INT32_MAX || FullOffset < INT32_MIN) { \
+    if (FullOffset > MAX_INT32 || FullOffset < MIN_INT32) { \
         LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW, \
                  "Relative call offset %lld out of INT32 range (target: 0x%llx, source: 0x%llx)", \
                  FullOffset, (UINT64)(addr), (UINT64)(cp)); \
