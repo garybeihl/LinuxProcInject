@@ -215,10 +215,10 @@ Patched code looks like this:
 ```asm
 mov    rdi,0xffffffffXXX7e8e0           # &kthreadd_done
 mov    DWORD PTR[rip + 0x1563a20], 0x1  # system_state = SCHEDULING
-jmp    patch_2                          # patch_2 code below
+jmp    Patch2                           # Patch2 code below
 //     return_from_patch2:
 call   0xffffffffXXX013c0               # schedule_preempt_disabled
-                                        # goes multi-thread here 
+                                        # goes multi-thread here
 mov    edi, 0xe1                        # CPUHP_ONLINE
 call   0xffffffffXXXe87e0               # cpu_startup_entry
 pop    rbp
