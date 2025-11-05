@@ -252,9 +252,9 @@ pop     rdi
 xor     rax, rax          ; clear return status
 ret
 ```
-The patch_2 code:
+The Patch2 code:
 ```asm
-//    patch_2:
+//    Patch2:
 push    rdi                               # save &kthreadd_done
 // create new UEFI kernel thread
 push    rsi

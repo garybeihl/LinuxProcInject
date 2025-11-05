@@ -58,7 +58,7 @@ if (ReturnIndex >= INJECT_MAX_STACK_SCAN_DEPTH) {
 }
 
 // Safe to write
-Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+Rsp[ReturnIndex] = (UINT64)(DestinationPointer + sizeof(banner));
 ```
 
 **Impact**:
@@ -75,34 +75,34 @@ Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
 **Implementation**:
 ```c
 // Calculate destination
-destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+DestinationPointer = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
 
 // Validate destination is in kernel range
-if ((UINT64)destptr < INJECT_MIN_KERNEL_ADDRESS) {
+if ((UINT64)DestinationPointer < INJECT_MIN_KERNEL_ADDRESS) {
     LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
              "Patch 1 destination 0x%llx below minimum kernel address 0x%llx",
-             (UINT64)destptr, INJECT_MIN_KERNEL_ADDRESS);
+             (UINT64)DestinationPointer, INJECT_MIN_KERNEL_ADDRESS);
     return EFI_INVALID_PARAMETER;
 }
 
 // Validate pointer arithmetic didn't overflow
-if ((UINT64)destptr >= (UINT64)EevmReturnAddr) {
+if ((UINT64)DestinationPointer >= (UINT64)EevmReturnAddr) {
     LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
              "Patch 1 destination 0x%llx >= EevmReturnAddr 0x%llx (overflow)",
-             (UINT64)destptr, (UINT64)EevmReturnAddr);
+             (UINT64)DestinationPointer, (UINT64)EevmReturnAddr);
     return EFI_INVALID_PARAMETER;
 }
 
 // Safe to write
 for (i = 0; i < sizeof(banner); i++) {
-    destptr[i] = banner[i];
+    DestinationPointer[i] = banner[i];
 }
 ```
 
 **Impact**:
 - Ensures destination is in valid kernel address range (>= 0xFFFFFFFF80000000)
 - Detects pointer arithmetic overflow (subtraction wrapping)
-- Validates memory layout is correct (destptr < EevmReturnAddr)
+- Validates memory layout is correct (DestinationPointer < EevmReturnAddr)
 - **Critical safety check** - prevents arbitrary memory writes
 
 #### Validation 2b: Memory Write Protection - Patch 2
@@ -113,20 +113,20 @@ for (i = 0; i < sizeof(banner); i++) {
 **Implementation**:
 ```c
 // Calculate patch locations
-patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
+Patch2 = StartKernelRetAddr - sizeof(patch_code_2);
 
-// Validate patch_2 address
-if ((UINT64)patch_2 < INJECT_MIN_KERNEL_ADDRESS) {
+// Validate Patch2 address
+if ((UINT64)Patch2 < INJECT_MIN_KERNEL_ADDRESS) {
     LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
              "Patch 2 destination 0x%llx below minimum kernel address 0x%llx",
-             (UINT64)patch_2, INJECT_MIN_KERNEL_ADDRESS);
+             (UINT64)Patch2, INJECT_MIN_KERNEL_ADDRESS);
     return EFI_INVALID_PARAMETER;
 }
 
-if ((UINT64)patch_2 >= (UINT64)StartKernelRetAddr) {
+if ((UINT64)Patch2 >= (UINT64)StartKernelRetAddr) {
     LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
              "Patch 2 destination 0x%llx >= StartKernelRetAddr 0x%llx (overflow)",
-             (UINT64)patch_2, (UINT64)StartKernelRetAddr);
+             (UINT64)Patch2, (UINT64)StartKernelRetAddr);
     return EFI_INVALID_PARAMETER;
 }
 
@@ -140,19 +140,19 @@ if ((UINT64)cp < INJECT_MIN_KERNEL_ADDRESS) {
     return EFI_INVALID_PARAMETER;
 }
 
-if ((UINT64)cp >= (UINT64)patch_2) {
+if ((UINT64)cp >= (UINT64)Patch2) {
     LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
-             "proc_template destination 0x%llx >= patch_2 0x%llx (invalid layout)",
-             (UINT64)cp, (UINT64)patch_2);
+             "proc_template destination 0x%llx >= Patch2 0x%llx (invalid layout)",
+             (UINT64)cp, (UINT64)Patch2);
     return EFI_INVALID_PARAMETER;
 }
 
-// Safe to write both proc_template and patch_2
+// Safe to write both proc_template and Patch2
 ```
 
 **Impact**:
-- Validates both patch_2 and proc_template destinations
-- Ensures correct memory layout (cp < patch_2 < StartKernelRetAddr)
+- Validates both Patch2 and proc_template destinations
+- Ensures correct memory layout (cp < Patch2 < StartKernelRetAddr)
 - Detects pointer arithmetic overflow
 - Validates kernel address range for large writes
 - **Critical safety check** - validates largest memory writes in the system
@@ -173,15 +173,15 @@ if ((UINT64)EevmReturnAddr < INJECT_MIN_KERNEL_ADDRESS) {
 }
 
 // Validate pointer arithmetic for offset read
-UINT8* readAddr = EevmReturnAddr + 0x10;
-if ((UINT64)readAddr < (UINT64)EevmReturnAddr) {
+UINT8* ReadAddress = EevmReturnAddr + 0x10;
+if ((UINT64)ReadAddress < (UINT64)EevmReturnAddr) {
     LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
              "Pointer overflow: EevmReturnAddr + 0x10 wrapped around");
     return EFI_INVALID_PARAMETER;
 }
 
 // Read offset and calculate printk
-offset = *(INT32*)readAddr;
+offset = *(INT32*)ReadAddress;
 Context->KernelFuncs.Printk = (EevmReturnAddr + 0x14) + offset;
 
 // Validate calculated printk address

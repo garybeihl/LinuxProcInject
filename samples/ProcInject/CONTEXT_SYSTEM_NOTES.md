@@ -10,9 +10,9 @@ The context system replaces scattered global variables with a structured runtime
 - `StrBuffer[256]` - String buffer for messages
 - `printk`, `__kmalloc`, `msleep`, `kthread_create_on_node` - Kernel function addresses
 - `banner[]` - Banner string
-- `destptr` - Patch destination pointer
+- `DestinationPointer` - Patch destination pointer
 - `arch_call_rest_init`, `rest_init`, `complete`, `return_from_patch` - Init function addresses
-- `patch_2` - Patch location pointer
+- `Patch2` - Patch location pointer
 
 **Issues**:
 1. **Poor encapsulation**: State scattered across multiple global variables
@@ -238,12 +238,12 @@ UINT8* __kmalloc;
 UINT8* msleep;
 UINT8* kthread_create_on_node;
 UINT8  banner[];
-UINT8* destptr;
+UINT8* DestinationPointer;
 UINT8* arch_call_rest_init;
 UINT8* rest_init;
 UINT8* complete;
 UINT8* return_from_patch;
-UINT8* patch_2;
+UINT8* Patch2;
 ```
 
 **After**: 2 global variables (essential only)

@@ -22,7 +22,7 @@ This document analyzes missing input validation and bounds checking in ProcInjec
 ```c
 for (i = 0x28; i < 0x48; i++) {
     if ((Rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
-        candidateAddr = (UINT8*)Rsp[i];
+        CandidateAddress = (UINT8*)Rsp[i];
         // ...
     }
 }
@@ -93,7 +93,7 @@ for (i = StartIndex + 1; i < scanLimit; i++) {
 **Location**: drvmain.c:392
 
 ```c
-Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+Rsp[ReturnIndex] = (UINT64)(DestinationPointer + sizeof(banner));
 ```
 
 **Problem**:
@@ -112,7 +112,7 @@ if (ReturnIndex < EEVM_SCAN_START || ReturnIndex >= EEVM_SCAN_END) {
     return EFI_INVALID_PARAMETER;
 }
 
-Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+Rsp[ReturnIndex] = (UINT64)(DestinationPointer + sizeof(banner));
 ```
 
 ### 2. Pointer Arithmetic Without Range Validation
@@ -143,14 +143,14 @@ if ((UINT64)EevmReturnAddr < 0xFFFFFFFF00000000L) {
 }
 
 // Check we can safely read at offset 0x10
-UINT8* readAddr = EevmReturnAddr + 0x10;
-if ((UINT64)readAddr < (UINT64)EevmReturnAddr) {
+UINT8* ReadAddress = EevmReturnAddr + 0x10;
+if ((UINT64)ReadAddress < (UINT64)EevmReturnAddr) {
     LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
              "Pointer arithmetic overflow");
     return EFI_INVALID_PARAMETER;
 }
 
-offset = *(INT32*)readAddr;
+offset = *(INT32*)ReadAddress;
 
 // Validate calculated address is in kernel range
 UINT8* calculatedAddr = (EevmReturnAddr + 0x14) + offset;
@@ -231,14 +231,14 @@ if (bytesScanned >= MAX_CALL_SCAN_BYTES) {
 **Location**: drvmain.c:359-370
 
 ```c
-destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+DestinationPointer = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
 
 for (i = 0; i < sizeof(banner); i++) {
-    destptr[i] = banner[i];
+    DestinationPointer[i] = banner[i];
 }
 
 for (j = 0; j < sizeof(printk_banner_template); j++) {
-    destptr[i + j] = printk_banner_template[j];
+    DestinationPointer[i + j] = printk_banner_template[j];
 }
 ```
 
@@ -256,15 +256,15 @@ for (j = 0; j < sizeof(printk_banner_template); j++) {
 UINT8* minKernelAddr = (UINT8*)0xFFFFFFFF80000000L;  // Typical kernel start
 UINT8* maxKernelAddr = (UINT8*)0xFFFFFFFFFFFFFFFFL;
 
-destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+DestinationPointer = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
 
-if ((UINT64)destptr < (UINT64)minKernelAddr) {
+if ((UINT64)DestinationPointer < (UINT64)minKernelAddr) {
     LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED,
-             "Patch destination 0x%llx below kernel range", destptr);
+             "Patch destination 0x%llx below kernel range", DestinationPointer);
     return EFI_INVALID_PARAMETER;
 }
 
-if ((UINT64)destptr > (UINT64)EevmReturnAddr) {
+if ((UINT64)DestinationPointer > (UINT64)EevmReturnAddr) {
     LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED,
              "Pointer arithmetic resulted in higher address");
     return EFI_INVALID_PARAMETER;
@@ -275,7 +275,7 @@ if ((UINT64)destptr > (UINT64)EevmReturnAddr) {
 
 // Proceed with copy
 for (i = 0; i < sizeof(banner); i++) {
-    destptr[i] = banner[i];
+    DestinationPointer[i] = banner[i];
 }
 ```
 
@@ -288,7 +288,7 @@ for (i = 0; i < sizeof(proc_template); i++) {
     *cp++ = proc_template[i];
 }
 
-cp = patch_2;
+cp = Patch2;
 for (i = 0; i < sizeof(patch_code_2); i++) {
     *cp++ = patch_code_2[i];
 }
@@ -315,11 +315,11 @@ if ((UINT64)cp < (UINT64)minKernelAddr ||
     return EFI_INVALID_PARAMETER;
 }
 
-// Validate patch_2 address
-if ((UINT64)patch_2 < (UINT64)minKernelAddr ||
-    (UINT64)patch_2 > (UINT64)StartKernelRetAddr) {
+// Validate Patch2 address
+if ((UINT64)Patch2 < (UINT64)minKernelAddr ||
+    (UINT64)Patch2 > (UINT64)StartKernelRetAddr) {
     LOG_ERROR(INJECT_ERROR_PATCH2_INSTALL_FAILED,
-             "patch_2 address 0x%llx out of range", patch_2);
+             "Patch2 address 0x%llx out of range", Patch2);
     return EFI_INVALID_PARAMETER;
 }
 

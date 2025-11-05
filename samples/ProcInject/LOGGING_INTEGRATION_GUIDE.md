@@ -178,7 +178,7 @@ if (StartKernelRetAddr == NULL || ReturnFromPatch == NULL || CompleteCall == NUL
     return status;
 }
 
-LOG_DEBUG("Installing Patch 2 at 0x%llx", patch_2);
+LOG_DEBUG("Installing Patch 2 at 0x%llx", Patch2);
 LOG_VERBOSE("Copying proc_template (%d bytes)", sizeof(proc_template));
 LOG_VERBOSE("Copying patch_code_2 (%d bytes)", sizeof(patch_code_2));
 
@@ -189,7 +189,7 @@ LOG_VERBOSE("Fixed up complete() call");
 LOG_VERBOSE("Fixed up return jump");
 
 // On success:
-LOG_INFO("Patch 2 installed successfully at 0x%llx", patch_2);
+LOG_INFO("Patch 2 installed successfully at 0x%llx", Patch2);
 
 // At end:
 status = EFI_SUCCESS;
