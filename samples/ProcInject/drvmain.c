@@ -162,7 +162,7 @@ FindEfiEnterVirtualModeReturnAddr(
 )
 {
     UINTN i;
-    UINT8* candidateAddr;
+    UINT8* CandidateAddress;
     EFI_STATUS status;
     UINT64* Rsp;
 
@@ -196,21 +196,21 @@ FindEfiEnterVirtualModeReturnAddr(
         // Check if this looks like a kernel address (high canonical address)
         //
         if ((Rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
-            candidateAddr = (UINT8*)Rsp[i];
-            LOG_VERBOSE("Checking stack[0x%x] = 0x%llx", i, candidateAddr);
+            CandidateAddress = (UINT8*)Rsp[i];
+            LOG_VERBOSE("Checking stack[0x%x] = 0x%llx", i, CandidateAddress);
 
             //
             // Verify if this address points to the expected code pattern
             //
-            if (VerifyEfiEnterVirtualMode(candidateAddr)) {
+            if (VerifyEfiEnterVirtualMode(CandidateAddress)) {
                 //
                 // Store results in context
                 //
-                Context->Stack.EevmReturnAddr = candidateAddr;
+                Context->Stack.EevmReturnAddr = CandidateAddress;
                 Context->Stack.EevmStackIndex = i;
 
                 LOG_INFO("Found efi_enter_virtual_mode return address: 0x%llx (stack index 0x%x)",
-                        candidateAddr, i);
+                        CandidateAddress, i);
 
                 status = EFI_SUCCESS;
                 LOG_FUNCTION_EXIT(status);
@@ -284,8 +284,8 @@ CalculateKernelFunctionAddresses(
     //
     // Validate pointer arithmetic for reading offset
     //
-    UINT8* readAddr = EevmReturnAddr + 0x10;
-    if ((UINT64)readAddr < (UINT64)EevmReturnAddr) {
+    UINT8* ReadAddress = EevmReturnAddr + 0x10;
+    if ((UINT64)ReadAddress < (UINT64)EevmReturnAddr) {
         LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
                  "Pointer overflow: EevmReturnAddr + 0x10 wrapped around");
         status = EFI_INVALID_PARAMETER;
@@ -293,7 +293,7 @@ CalculateKernelFunctionAddresses(
         return status;
     }
 
-    offset = *(INT32*)readAddr;
+    offset = *(INT32*)ReadAddress;
     Context->KernelFuncs.Printk = (EevmReturnAddr + 0x14) + offset;
 
     //
@@ -380,7 +380,7 @@ InstallPatch1_PrintkBanner(
 {
     UINTN i, j;
     UINT8* cp;
-    UINT8* destptr;
+    UINT8* DestinationPointer;
     UINT64* Rsp;
     UINT8* EevmReturnAddr;
     UINTN ReturnIndex;
@@ -413,41 +413,41 @@ InstallPatch1_PrintkBanner(
     // Calculate destination for patch code
     // We write immediately before the return address in already-executed code
     //
-    destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
-    LOG_DEBUG("Patch 1 destination: 0x%llx", destptr);
+    DestinationPointer = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+    LOG_DEBUG("Patch 1 destination: 0x%llx", DestinationPointer);
 
     //
     // CRITICAL: Validate destination address before writing
     // Ensure we're writing to kernel address space
     //
-    if ((UINT64)destptr < INJECT_MIN_KERNEL_ADDRESS) {
+    if ((UINT64)DestinationPointer < INJECT_MIN_KERNEL_ADDRESS) {
         LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
                  "Patch 1 destination 0x%llx below minimum kernel address 0x%llx",
-                 (UINT64)destptr, INJECT_MIN_KERNEL_ADDRESS);
+                 (UINT64)DestinationPointer, INJECT_MIN_KERNEL_ADDRESS);
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
     //
-    // Validate pointer arithmetic didn't overflow (destptr should be < EevmReturnAddr)
+    // Validate pointer arithmetic didn't overflow (DestinationPointer should be < EevmReturnAddr)
     //
-    if ((UINT64)destptr >= (UINT64)EevmReturnAddr) {
+    if ((UINT64)DestinationPointer >= (UINT64)EevmReturnAddr) {
         LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
                  "Patch 1 destination 0x%llx >= EevmReturnAddr 0x%llx (overflow)",
-                 (UINT64)destptr, (UINT64)EevmReturnAddr);
+                 (UINT64)DestinationPointer, (UINT64)EevmReturnAddr);
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
-    LOG_VERBOSE("Patch 1 destination validated: 0x%llx", (UINT64)destptr);
+    LOG_VERBOSE("Patch 1 destination validated: 0x%llx", (UINT64)DestinationPointer);
 
     //
     // Copy the banner string
     //
     for (i = 0; i < sizeof(banner); i++) {
-        destptr[i] = banner[i];
+        DestinationPointer[i] = banner[i];
     }
     LOG_VERBOSE("Copied banner string (%d bytes)", sizeof(banner));
 
@@ -455,7 +455,7 @@ InstallPatch1_PrintkBanner(
     // Copy the printk call template
     //
     for (j = 0; j < sizeof(printk_banner_template); j++) {
-        destptr[i + j] = printk_banner_template[j];
+        DestinationPointer[i + j] = printk_banner_template[j];
     }
     LOG_VERBOSE("Copied printk template (%d bytes)", sizeof(printk_banner_template));
 
@@ -463,8 +463,8 @@ InstallPatch1_PrintkBanner(
     // Fix up the addresses in the patched code
     // 1. mov rdi, Message1 (pointer to banner string)
     //
-    cp = destptr + (sizeof(banner) + 4);
-    *(INT32*)cp = (INT32)(INT64)destptr;
+    cp = DestinationPointer + (sizeof(banner) + 4);
+    *(INT32*)cp = (INT32)(INT64)DestinationPointer;
     LOG_VERBOSE("Fixed up banner address");
 
     //
@@ -496,17 +496,17 @@ InstallPatch1_PrintkBanner(
         return status;
     }
 
-    Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+    Rsp[ReturnIndex] = (UINT64)(DestinationPointer + sizeof(banner));
     LOG_DEBUG("Modified stack return address to 0x%llx (validated index 0x%x)",
              Rsp[ReturnIndex], ReturnIndex);
 
     //
     // Store patch location in context
     //
-    Context->Patches.Patch1Destination = destptr;
+    Context->Patches.Patch1Destination = DestinationPointer;
     Context->Patches.Patch1Installed = TRUE;
 
-    LOG_INFO("Patch 1 installed successfully at 0x%llx", destptr);
+    LOG_INFO("Patch 1 installed successfully at 0x%llx", DestinationPointer);
 
     status = EFI_SUCCESS;
     LOG_FUNCTION_EXIT(status);
@@ -751,7 +751,7 @@ InstallPatch2_KthreadCreate(
 {
     UINT8* cp;
     UINTN i;
-    UINT8* patch_2;
+    UINT8* Patch2;
     UINT8* StartKernelRetAddr;
     UINT8* ReturnFromPatch;
     UINT8* CompleteCall;
@@ -782,32 +782,32 @@ InstallPatch2_KthreadCreate(
     //
     // Calculate patch location
     //
-    patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
-    LOG_DEBUG("Patch 2 destination: 0x%llx", (UINT64)patch_2);
+    Patch2 = StartKernelRetAddr - sizeof(patch_code_2);
+    LOG_DEBUG("Patch 2 destination: 0x%llx", (UINT64)Patch2);
 
     //
-    // CRITICAL: Validate patch_2 address before writing
+    // CRITICAL: Validate Patch2 address before writing
     //
-    if ((UINT64)patch_2 < INJECT_MIN_KERNEL_ADDRESS) {
+    if ((UINT64)Patch2 < INJECT_MIN_KERNEL_ADDRESS) {
         LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
                  "Patch 2 destination 0x%llx below minimum kernel address 0x%llx",
-                 (UINT64)patch_2, INJECT_MIN_KERNEL_ADDRESS);
+                 (UINT64)Patch2, INJECT_MIN_KERNEL_ADDRESS);
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
-    if ((UINT64)patch_2 >= (UINT64)StartKernelRetAddr) {
+    if ((UINT64)Patch2 >= (UINT64)StartKernelRetAddr) {
         LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
                  "Patch 2 destination 0x%llx >= StartKernelRetAddr 0x%llx (overflow)",
-                 (UINT64)patch_2, (UINT64)StartKernelRetAddr);
+                 (UINT64)Patch2, (UINT64)StartKernelRetAddr);
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
     //
-    // Calculate proc_template location (before patch_2)
+    // Calculate proc_template location (before Patch2)
     //
     cp = StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template));
     LOG_DEBUG("proc_template will be at: 0x%llx", (UINT64)cp);
@@ -824,20 +824,20 @@ InstallPatch2_KthreadCreate(
         return status;
     }
 
-    if ((UINT64)cp >= (UINT64)patch_2) {
+    if ((UINT64)cp >= (UINT64)Patch2) {
         LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
-                 "proc_template destination 0x%llx >= patch_2 0x%llx (invalid layout)",
-                 (UINT64)cp, (UINT64)patch_2);
+                 "proc_template destination 0x%llx >= Patch2 0x%llx (invalid layout)",
+                 (UINT64)cp, (UINT64)Patch2);
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
-    LOG_VERBOSE("Patch 2 destinations validated: proc_template=0x%llx, patch_2=0x%llx",
-               (UINT64)cp, (UINT64)patch_2);
+    LOG_VERBOSE("Patch 2 destinations validated: proc_template=0x%llx, Patch2=0x%llx",
+               (UINT64)cp, (UINT64)Patch2);
 
     //
-    // Write the proc_template (thread code + data) immediately before patch_2
+    // Write the proc_template (thread code + data) immediately before Patch2
     // This goes in already-executed init code that will be reclaimed
     //
     for (i = 0; i < sizeof(proc_template); i++) {
@@ -846,54 +846,54 @@ InstallPatch2_KthreadCreate(
     LOG_VERBOSE("Copied proc_template (%d bytes)", sizeof(proc_template));
 
     //
-    // Write the patch_2 code (kthread allocation and creation)
+    // Write the Patch2 code (kthread allocation and creation)
     //
-    cp = patch_2;
+    cp = Patch2;
     for (i = 0; i < sizeof(patch_code_2); i++) {
         *cp++ = patch_code_2[i];
     }
     LOG_VERBOSE("Copied patch_code_2 (%d bytes)", sizeof(patch_code_2));
 
     //
-    // Fix up the call addresses in patch_2
+    // Fix up the call addresses in Patch2
     //
 
     // 1. call __kmalloc
-    cp = patch_2 + 0x13;
+    cp = Patch2 + 0x13;
     PUT_FIXUP(cp, Context->KernelFuncs.Kmalloc);
     LOG_VERBOSE("Fixed up __kmalloc call at offset 0x13");
 
     // 2. call kthread_create_on_node
-    cp = patch_2 + 0x3d;
+    cp = Patch2 + 0x3d;
     PUT_FIXUP(cp, Context->KernelFuncs.KthreadCreateOnNode);
     LOG_VERBOSE("Fixed up kthread_create_on_node call at offset 0x3d");
 
     // 3. call complete(&kthreadd_done)
-    cp = patch_2 + (sizeof(patch_code_2) - 9);
+    cp = Patch2 + (sizeof(patch_code_2) - 9);
     PUT_FIXUP(cp, CompleteCall);
     LOG_VERBOSE("Fixed up complete() call");
 
     // 4. jmp back to rest_init
-    cp = patch_2 + (sizeof(patch_code_2) - 4);
+    cp = Patch2 + (sizeof(patch_code_2) - 4);
     PUT_FIXUP(cp, (ReturnFromPatch + 5));
     LOG_VERBOSE("Fixed up return jump to 0x%llx", (UINT64)(ReturnFromPatch + 5));
 
     //
-    // Patch the rest_init() code to jump to our patch_2
+    // Patch the rest_init() code to jump to our Patch2
     //
     cp = ReturnFromPatch;
     *cp = 0xe9;  // direct near jmp opcode
     cp++;
-    PUT_FIXUP(cp, patch_2);
-    LOG_DEBUG("Patched rest_init at 0x%llx with jump to patch_2", (UINT64)ReturnFromPatch);
+    PUT_FIXUP(cp, Patch2);
+    LOG_DEBUG("Patched rest_init at 0x%llx with jump to Patch2", (UINT64)ReturnFromPatch);
 
     //
     // Store patch location in context
     //
-    Context->Patches.Patch2Destination = patch_2;
+    Context->Patches.Patch2Destination = Patch2;
     Context->Patches.Patch2Installed = TRUE;
 
-    LOG_INFO("Patch 2 installed successfully at 0x%llx", (UINT64)patch_2);
+    LOG_INFO("Patch 2 installed successfully at 0x%llx", (UINT64)Patch2);
 
     status = EFI_SUCCESS;
     LOG_FUNCTION_EXIT(status);
