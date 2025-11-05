@@ -1,4 +1,5 @@
 #include "drv.h"
+#include "kernel_config.h"
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeLib.h>
 
@@ -57,12 +58,9 @@ SerialOutString(
     }
 }
 
-UINT8 efi_enter_virtual_mode_template[] = {
-    0x48, 0x89, 0xc6, 0x48, 0x85, 0xc0, 0x74, 0x0e,
-    0x48, 0xc7, 0xc7, 0x40, 0xcd, 0x9b, 0xb1, 0xe8,  // bytes 13 and 14 can vary
-    0x7d, 0x63, 0x9b, 0xfe, 0xeb, 0x2d, 0xe8, 0x80,
-    0x39, 0x04, 0x00, 0xe8, 0x62, 0xf1, 0xff, 0xff
-};
+//
+// Code templates for kernel patching
+//
 
 UINT8 printk_banner_template[] = {
     0x50, // push rax
@@ -119,6 +117,10 @@ UINT8 patch_code_2[] = {
 	    0xe9, 0x00, 0x00, 0x00, 0x00  // jmp back into rest_init() code
 };
 
+// Configuration and state
+INJECT_CONFIG gInjectConfig;
+
+// Runtime state (discovered addresses and pointers)
 UINT8 StrBuffer[256]; // For debug messages
 UINT8* printk;        // Address of the printk routine in linux kernel
 UINT8* __kmalloc;     // Address of the __kmalloc routine in linux kernel
@@ -135,24 +137,16 @@ EFI_EVENT mVirtMemEvt;
 
 #define PUT_FIXUP(cp, addr) *(INT32*)cp = (INT32)(INT64)(addr - (cp + 4))
 
+/**
+ * Verify if code pointer matches efi_enter_virtual_mode return address
+ * Uses kernel configuration pattern matching
+ *
+ * @param cp    Code pointer to verify
+ * @return TRUE if pattern matches, FALSE otherwise
+ */
 BOOLEAN
 VerifyEfiEnterVirtualMode(UINT8* cp) {
-    int i;
-    UINT8 *origcp = cp;
-    UINT64 rptr;
-
-    for (i = 0; i < sizeof(efi_enter_virtual_mode_template); i++) {
-        if ((*cp != efi_enter_virtual_mode_template[i]) && (i != 13) && (i != 14)) {
-            return FALSE;
-        }
-        cp++;
-    }
-    rptr = (UINT64)(INT64) * (INT32*)(origcp + 0xb); // mov rdi, 0xffffffffxxxxxxxx instruction
-    rptr += 2; // Getting ready to call printk from efi_enter_virtual_mode?
-    if (AsciiStrCmp((UINT8*)rptr, "efi: Unable to switch EFI into virtual mode (status=%lx)!\n")) {
-        return FALSE;
-    }
-    return TRUE;
+    return VerifyEfiEnterVirtualModePattern(cp, gInjectConfig.KernelConfig);
 }
 
 VOID
@@ -200,13 +194,22 @@ VirtMemCallback(
 	if (found) {
 		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Found efi_enter_virtual_mode return addr @ 0x%llx!\n", eevm_retaddr);
 		SerialOutString(StrBuffer);
+
+		// Calculate printk address from the call instruction
 		offset = *(INT32*)(eevm_retaddr + 0x10);
 		printk = (eevm_retaddr + 0x14) + offset;
-		__kmalloc = (UINT8*)((UINT64)printk - 0x8b8986); // System.map tells us this
-		msleep = (UINT8*)((UINT64)printk - 0xa5f1e6);    // System.map tells us this
-		kthread_create_on_node = (UINT8*)((UINT64)printk - 0xad5e66); // System.map tells us this
+
+		// Use kernel configuration to calculate other function addresses
+		__kmalloc = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToKmalloc);
+		msleep = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToMsleep);
+		kthread_create_on_node = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToKthreadCreateOnNode);
+
+		// Fix up the msleep call in our kthread code template
 		cp = &proc_template[17];
-		*(UINT64*)cp = (UINT64)msleep; // fixup the msleep call in our kthread code
+		*(UINT64*)cp = (UINT64)msleep;
+
+		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Kernel: %a\n", gInjectConfig.KernelConfig->VersionString);
+		SerialOutString(StrBuffer);
 		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Offset = 0x%lx, printk = 0x%llx, __kmalloc = 0x%llx, msleep = 0x%llx, retaddr_index = 0x%x\n", offset, printk, __kmalloc, msleep, retaddr_index);
 		SerialOutString(StrBuffer);
 	}
@@ -352,8 +355,9 @@ VirtMemCallback(
 	//             pop  rdi                               # restore &kthreadd_done
 	//             call 0xffffffffa4500b10                # complete(&kthreadd_done)
 	//             jmp  0xffffffffa4ff7e29                # resume rest_init() code
-	//             
-	cp = rest_init + 0xa4; // TODO: Hard-coded offset here, we should search for the correct call insns at the end of rest_init
+	//
+	// Use kernel configuration for offset to complete() call
+	cp = rest_init + gInjectConfig.KernelConfig->RestInitToCompleteOffset;
 	if (*cp != 0xe8) {
 		// Something not right, this should be a call insn
 		return;
@@ -426,6 +430,17 @@ UefiMain (
     )
 {
     EFI_STATUS efiStatus;
+
+    //
+    // Initialize kernel configuration
+    //
+    efiStatus = InitializeKernelConfig(&gInjectConfig);
+    if (EFI_ERROR(efiStatus)) {
+        Print(L"Failed to initialize kernel configuration: %r\n", efiStatus);
+        return efiStatus;
+    }
+
+    Print(L"ProcInject v0.7 - Kernel target: %a\n", gInjectConfig.KernelConfig->VersionString);
     Print(L"VirtualMemCallback = 0x%llx...\n", (UINT64)VirtMemCallback);
     //
     // Install the SetVirtualAddressMap callback
