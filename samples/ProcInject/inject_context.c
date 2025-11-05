@@ -6,7 +6,6 @@
 //
 
 #include <Uefi.h>
-#include <Library/BaseMemoryLib.h>
 #include "inject_context.h"
 #include "logging.h"
 
@@ -29,23 +28,37 @@ InitializeInjectContext(
     }
 
     //
-    // Zero out entire structure
-    //
-    ZeroMem(Context, sizeof(INJECT_RUNTIME_CONTEXT));
-
-    //
-    // Set signature for validation
+    // Initialize all fields explicitly
+    // Do NOT use ZeroMem() - it may not work during SetVirtualAddressMap callback
     //
     Context->Signature = INJECT_CONTEXT_SIGNATURE;
-
-    //
-    // Store configuration reference
-    //
     Context->Config = Config;
 
-    //
-    // Initialize progress tracking
-    //
+    // Stack discovery fields
+    Context->Stack.StackPointer = NULL;
+    Context->Stack.EevmReturnAddr = NULL;
+    Context->Stack.EevmStackIndex = 0;
+    Context->Stack.StartKernelRetAddr = NULL;
+
+    // Kernel function addresses
+    Context->KernelFuncs.Printk = NULL;
+    Context->KernelFuncs.Kmalloc = NULL;
+    Context->KernelFuncs.Msleep = NULL;
+    Context->KernelFuncs.KthreadCreateOnNode = NULL;
+
+    // Kernel init function addresses
+    Context->InitFuncs.ArchCallRestInit = NULL;
+    Context->InitFuncs.RestInit = NULL;
+    Context->InitFuncs.Complete = NULL;
+    Context->InitFuncs.ReturnFromPatch = NULL;
+
+    // Patch tracking
+    Context->Patches.Patch1Destination = NULL;
+    Context->Patches.Patch2Destination = NULL;
+    Context->Patches.Patch1Installed = FALSE;
+    Context->Patches.Patch2Installed = FALSE;
+
+    // Progress tracking
     Context->CurrentStep = 0;
     Context->StepsCompleted = 0;
     Context->LastError = EFI_SUCCESS;
@@ -160,17 +173,35 @@ ResetInjectContext(
     savedConfig = Context->Config;
 
     //
-    // Zero out all runtime state
+    // Reset all runtime state explicitly
+    // Do NOT use ZeroMem() - it may not work during SetVirtualAddressMap callback
     //
-    ZeroMem(&Context->Stack, sizeof(STACK_DISCOVERY));
-    ZeroMem(&Context->KernelFuncs, sizeof(KERNEL_FUNCTIONS));
-    ZeroMem(&Context->InitFuncs, sizeof(KERNEL_INIT_FUNCTIONS));
-    ZeroMem(&Context->Patches, sizeof(PATCH_LOCATIONS));
-    ZeroMem(Context->StringBuffer, sizeof(Context->StringBuffer));
 
-    //
-    // Reset progress tracking
-    //
+    // Stack discovery fields
+    Context->Stack.StackPointer = NULL;
+    Context->Stack.EevmReturnAddr = NULL;
+    Context->Stack.EevmStackIndex = 0;
+    Context->Stack.StartKernelRetAddr = NULL;
+
+    // Kernel function addresses
+    Context->KernelFuncs.Printk = NULL;
+    Context->KernelFuncs.Kmalloc = NULL;
+    Context->KernelFuncs.Msleep = NULL;
+    Context->KernelFuncs.KthreadCreateOnNode = NULL;
+
+    // Kernel init function addresses
+    Context->InitFuncs.ArchCallRestInit = NULL;
+    Context->InitFuncs.RestInit = NULL;
+    Context->InitFuncs.Complete = NULL;
+    Context->InitFuncs.ReturnFromPatch = NULL;
+
+    // Patch tracking
+    Context->Patches.Patch1Destination = NULL;
+    Context->Patches.Patch2Destination = NULL;
+    Context->Patches.Patch1Installed = FALSE;
+    Context->Patches.Patch2Installed = FALSE;
+
+    // Progress tracking
     Context->CurrentStep = 0;
     Context->StepsCompleted = 0;
     Context->LastError = EFI_SUCCESS;
@@ -183,34 +214,3 @@ ResetInjectContext(
     LOG_DEBUG("Inject context reset");
 }
 
-/**
- * Get a string buffer from context for temporary use
- *
- * This provides a safe way to get a working buffer without
- * using global variables. The buffer is shared across all
- * operations, so callers must use it immediately.
- *
- * @param Context   Context structure
- * @param Size      Output: Size of the buffer
- * @return Pointer to string buffer, or NULL on error
- */
-CHAR8*
-EFIAPI
-GetContextStringBuffer(
-    IN  INJECT_RUNTIME_CONTEXT* Context,
-    OUT UINTN* Size
-)
-{
-    if (!ValidateInjectContext(Context)) {
-        if (Size != NULL) {
-            *Size = 0;
-        }
-        return NULL;
-    }
-
-    if (Size != NULL) {
-        *Size = sizeof(Context->StringBuffer);
-    }
-
-    return Context->StringBuffer;
-}

@@ -72,8 +72,8 @@ CONST KERNEL_OFFSET_CONFIG gKernelConfig_5_13_0_30 = {
         0xFF, 0xFF, 0xFF,       // test rax, rax
         0xFF, 0xFF,             // je
         0xFF, 0xFF, 0xFF,       // mov rdi
-        0x00, 0x00,             // <variable immediate bytes>
         0xFF, 0xFF,             // <fixed immediate bytes>
+        0x00, 0x00,             // <variable immediate bytes>
         0xFF, 0xFF, 0xFF, 0xFF, // call
         0xFF, 0xFF,             // jmp
         0xFF, 0xFF, 0xFF, 0xFF, // call

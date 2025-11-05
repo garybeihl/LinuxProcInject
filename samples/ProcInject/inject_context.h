@@ -74,12 +74,6 @@ typedef struct _INJECT_RUNTIME_CONTEXT {
     PATCH_LOCATIONS Patches;
 
     //
-    // Working buffer for string operations
-    // Used by logging and SerialOut functions
-    //
-    CHAR8 StringBuffer[512];
-
-    //
     // Injection progress tracking
     //
     UINT8 CurrentStep;              // Current step (0-6)
@@ -174,23 +168,6 @@ VOID
 EFIAPI
 ResetInjectContext(
     IN OUT INJECT_RUNTIME_CONTEXT* Context
-);
-
-/**
- * Get a string buffer from context for temporary use
- *
- * This provides a safe way to get a working buffer without
- * using global variables.
- *
- * @param Context   Context structure
- * @param Size      Output: Size of the buffer
- * @return Pointer to string buffer
- */
-CHAR8*
-EFIAPI
-GetContextStringBuffer(
-    IN  INJECT_RUNTIME_CONTEXT* Context,
-    OUT UINTN* Size
 );
 
 #endif // _INJECT_CONTEXT_H_
