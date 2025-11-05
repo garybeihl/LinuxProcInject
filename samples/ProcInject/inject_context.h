@@ -99,6 +99,16 @@ typedef struct _INJECT_RUNTIME_CONTEXT {
 #define INJECT_STEP_PATCH2_INSTALLED        BIT5
 
 //
+// Validation Constants for Bounds Checking
+//
+#define INJECT_MAX_STACK_SCAN_DEPTH     0x100   // 256 QWORDS = 2KB max stack scan
+#define INJECT_EEVM_SCAN_START          0x28    // Start of EEVM scan range
+#define INJECT_EEVM_SCAN_END            0x48    // End of EEVM scan range
+#define INJECT_MAX_CALL_SCAN_BYTES      1000    // 1KB max for call pattern scanning
+#define INJECT_MAX_FUNCTION_SIZE        2000    // 2KB max expected function size
+#define INJECT_MIN_KERNEL_ADDRESS       0xFFFFFFFF80000000ULL  // x86_64 kernel base
+
+//
 // Context management functions
 //
 

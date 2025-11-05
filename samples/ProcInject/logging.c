@@ -83,6 +83,10 @@ STATIC CONST ERROR_CODE_ENTRY gErrorCodeTable[] = {
     // General errors
     {INJECT_ERROR_INVALID_PARAMETER, "Invalid parameter"},
     {INJECT_ERROR_OUT_OF_RESOURCES, "Out of resources"},
+    {INJECT_ERROR_STACK_INDEX_OUT_OF_RANGE, "Stack index out of valid range"},
+    {INJECT_ERROR_ADDRESS_OUT_OF_RANGE, "Address out of kernel range"},
+    {INJECT_ERROR_POINTER_OVERFLOW, "Pointer arithmetic overflow"},
+    {INJECT_ERROR_MEMORY_NOT_WRITABLE, "Memory region not writable"},
     {INJECT_ERROR_UNKNOWN, "Unknown error"}
 };
 

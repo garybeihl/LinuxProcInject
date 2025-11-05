@@ -270,23 +270,84 @@ CalculateKernelFunctionAddresses(
     // Calculate printk address from the call instruction
     // The call instruction is at offset 0x10 from the return address
     //
-    offset = *(INT32*)(EevmReturnAddr + 0x10);
+    // CRITICAL: Validate EevmReturnAddr is in kernel range before dereferencing
+    //
+    if ((UINT64)EevmReturnAddr < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "EevmReturnAddr 0x%llx below minimum kernel address",
+                 (UINT64)EevmReturnAddr);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    //
+    // Validate pointer arithmetic for reading offset
+    //
+    UINT8* readAddr = EevmReturnAddr + 0x10;
+    if ((UINT64)readAddr < (UINT64)EevmReturnAddr) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "Pointer overflow: EevmReturnAddr + 0x10 wrapped around");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    offset = *(INT32*)readAddr;
     Context->KernelFuncs.Printk = (EevmReturnAddr + 0x14) + offset;
+
+    //
+    // CRITICAL: Validate calculated printk address is in kernel range
+    //
+    if ((UINT64)Context->KernelFuncs.Printk < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Calculated printk address 0x%llx below minimum kernel address",
+                 (UINT64)Context->KernelFuncs.Printk);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
     LOG_ADDRESS(LOG_LEVEL_INFO, "printk", Context->KernelFuncs.Printk);
+    LOG_VERBOSE("printk address validated: 0x%llx", (UINT64)Context->KernelFuncs.Printk);
 
     //
     // Use kernel configuration to calculate other function addresses
     //
     Context->KernelFuncs.Kmalloc = CalculateKernelAddress(Context->KernelFuncs.Printk,
                                                           Context->Config->KernelConfig->PrintkToKmalloc);
+    if ((UINT64)Context->KernelFuncs.Kmalloc < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Calculated __kmalloc address 0x%llx below minimum kernel address",
+                 (UINT64)Context->KernelFuncs.Kmalloc);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
     LOG_ADDRESS(LOG_LEVEL_DEBUG, "__kmalloc", Context->KernelFuncs.Kmalloc);
 
     Context->KernelFuncs.Msleep = CalculateKernelAddress(Context->KernelFuncs.Printk,
                                                          Context->Config->KernelConfig->PrintkToMsleep);
+    if ((UINT64)Context->KernelFuncs.Msleep < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Calculated msleep address 0x%llx below minimum kernel address",
+                 (UINT64)Context->KernelFuncs.Msleep);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
     LOG_ADDRESS(LOG_LEVEL_DEBUG, "msleep", Context->KernelFuncs.Msleep);
 
     Context->KernelFuncs.KthreadCreateOnNode = CalculateKernelAddress(Context->KernelFuncs.Printk,
                                                                        Context->Config->KernelConfig->PrintkToKthreadCreateOnNode);
+    if ((UINT64)Context->KernelFuncs.KthreadCreateOnNode < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Calculated kthread_create_on_node address 0x%llx below minimum kernel address",
+                 (UINT64)Context->KernelFuncs.KthreadCreateOnNode);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
     LOG_ADDRESS(LOG_LEVEL_DEBUG, "kthread_create_on_node", Context->KernelFuncs.KthreadCreateOnNode);
 
     //
@@ -356,6 +417,33 @@ InstallPatch1_PrintkBanner(
     LOG_DEBUG("Patch 1 destination: 0x%llx", destptr);
 
     //
+    // CRITICAL: Validate destination address before writing
+    // Ensure we're writing to kernel address space
+    //
+    if ((UINT64)destptr < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Patch 1 destination 0x%llx below minimum kernel address 0x%llx",
+                 (UINT64)destptr, INJECT_MIN_KERNEL_ADDRESS);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    //
+    // Validate pointer arithmetic didn't overflow (destptr should be < EevmReturnAddr)
+    //
+    if ((UINT64)destptr >= (UINT64)EevmReturnAddr) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "Patch 1 destination 0x%llx >= EevmReturnAddr 0x%llx (overflow)",
+                 (UINT64)destptr, (UINT64)EevmReturnAddr);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    LOG_VERBOSE("Patch 1 destination validated: 0x%llx", (UINT64)destptr);
+
+    //
     // Copy the banner string
     //
     for (i = 0; i < sizeof(banner); i++) {
@@ -388,9 +476,29 @@ InstallPatch1_PrintkBanner(
 
     //
     // Modify the stack return address to point to our patched code
+    // CRITICAL: Validate ReturnIndex before stack write to prevent corruption
     //
+    if (ReturnIndex < INJECT_EEVM_SCAN_START || ReturnIndex >= INJECT_EEVM_SCAN_END) {
+        LOG_ERROR(INJECT_ERROR_STACK_INDEX_OUT_OF_RANGE,
+                 "ReturnIndex 0x%x out of valid range (0x%x - 0x%x)",
+                 ReturnIndex, INJECT_EEVM_SCAN_START, INJECT_EEVM_SCAN_END);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    if (ReturnIndex >= INJECT_MAX_STACK_SCAN_DEPTH) {
+        LOG_ERROR(INJECT_ERROR_STACK_INDEX_OUT_OF_RANGE,
+                 "ReturnIndex 0x%x exceeds maximum stack scan depth 0x%x",
+                 ReturnIndex, INJECT_MAX_STACK_SCAN_DEPTH);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
     Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
-    LOG_DEBUG("Modified stack return address to 0x%llx", Rsp[ReturnIndex]);
+    LOG_DEBUG("Modified stack return address to 0x%llx (validated index 0x%x)",
+             Rsp[ReturnIndex], ReturnIndex);
 
     //
     // Store patch location in context
@@ -676,14 +784,62 @@ InstallPatch2_KthreadCreate(
     //
     patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
     LOG_DEBUG("Patch 2 destination: 0x%llx", (UINT64)patch_2);
-    LOG_DEBUG("proc_template will be at: 0x%llx",
-             (UINT64)(StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template))));
+
+    //
+    // CRITICAL: Validate patch_2 address before writing
+    //
+    if ((UINT64)patch_2 < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Patch 2 destination 0x%llx below minimum kernel address 0x%llx",
+                 (UINT64)patch_2, INJECT_MIN_KERNEL_ADDRESS);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    if ((UINT64)patch_2 >= (UINT64)StartKernelRetAddr) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "Patch 2 destination 0x%llx >= StartKernelRetAddr 0x%llx (overflow)",
+                 (UINT64)patch_2, (UINT64)StartKernelRetAddr);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    //
+    // Calculate proc_template location (before patch_2)
+    //
+    cp = StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template));
+    LOG_DEBUG("proc_template will be at: 0x%llx", (UINT64)cp);
+
+    //
+    // CRITICAL: Validate proc_template destination address
+    //
+    if ((UINT64)cp < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "proc_template destination 0x%llx below minimum kernel address 0x%llx",
+                 (UINT64)cp, INJECT_MIN_KERNEL_ADDRESS);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    if ((UINT64)cp >= (UINT64)patch_2) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "proc_template destination 0x%llx >= patch_2 0x%llx (invalid layout)",
+                 (UINT64)cp, (UINT64)patch_2);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    LOG_VERBOSE("Patch 2 destinations validated: proc_template=0x%llx, patch_2=0x%llx",
+               (UINT64)cp, (UINT64)patch_2);
 
     //
     // Write the proc_template (thread code + data) immediately before patch_2
     // This goes in already-executed init code that will be reclaimed
     //
-    cp = StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template));
     for (i = 0; i < sizeof(proc_template); i++) {
         *cp++ = proc_template[i];
     }
