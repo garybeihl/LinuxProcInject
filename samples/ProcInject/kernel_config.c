@@ -170,6 +170,12 @@ DetectKernelVersion(
 
 /**
  * Calculate kernel function address from printk and offset config
+ *
+ * Validates the result is in kernel address range and checks for overflow
+ *
+ * @param PrintkAddr    Base address (printk function)
+ * @param Offset        Signed offset from printk to target function
+ * @return Calculated address, or NULL on error
  */
 UINT8*
 EFIAPI
@@ -178,15 +184,41 @@ CalculateKernelAddress(
     IN INT64 Offset
 )
 {
+    UINT8* Result;
+
     if (PrintkAddr == NULL) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "PrintkAddr is NULL in CalculateKernelAddress");
+        return NULL;
+    }
+
+    //
+    // Validate PrintkAddr is in kernel range before calculation
+    //
+    if ((UINT64)PrintkAddr < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "PrintkAddr 0x%llx below kernel minimum",
+                 (UINT64)PrintkAddr);
         return NULL;
     }
 
     //
     // Apply signed offset to base address
-    // Cast to UINT64 for arithmetic, then back to pointer
+    // Cast to INT64 for arithmetic to handle negative offsets correctly
     //
-    return (UINT8*)((INT64)PrintkAddr + Offset);
+    Result = (UINT8*)((INT64)PrintkAddr + Offset);
+
+    //
+    // Validate result is in kernel address range
+    //
+    if ((UINT64)Result < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Calculated address 0x%llx (printk 0x%llx + offset %lld) below kernel minimum 0x%llx",
+                 (UINT64)Result, (UINT64)PrintkAddr, Offset, INJECT_MIN_KERNEL_ADDRESS);
+        return NULL;
+    }
+
+    return Result;
 }
 
 /**
@@ -209,7 +241,28 @@ VerifyPatternWithMask(
 {
     UINTN i;
 
+    //
+    // Validate input parameters
+    //
     if (Data == NULL || Pattern == NULL || Mask == NULL) {
+        LOG_ERROR(INJECT_ERROR_EEVM_PATTERN_MISMATCH,
+                 "Invalid pattern validation parameters (NULL pointer)");
+        return FALSE;
+    }
+
+    if (Size == 0) {
+        LOG_ERROR(INJECT_ERROR_EEVM_PATTERN_MISMATCH,
+                 "Invalid pattern validation size (zero)");
+        return FALSE;
+    }
+
+    //
+    // Validate Data pointer is in kernel address range
+    //
+    if ((UINT64)Data < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Data pointer 0x%llx outside kernel range for pattern validation",
+                 (UINT64)Data);
         return FALSE;
     }
 

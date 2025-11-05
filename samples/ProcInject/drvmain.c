@@ -201,13 +201,25 @@ FindEfiEnterVirtualModeReturnAddr(
         return status;
     }
 
-    LOG_DEBUG("Scanning stack for efi_enter_virtual_mode return address (0x28 - 0x48)");
+    LOG_DEBUG("Scanning stack for efi_enter_virtual_mode return address (0x%x - 0x%x)",
+             INJECT_EEVM_SCAN_START, INJECT_EEVM_SCAN_END);
 
     //
     // Search for the return address into efi_enter_virtual_mode
-    // We scan from offset 0x28 to 0x48 on the stack
+    // Use defined constants for scan range
     //
-    for (i = 0x28; i < 0x48; i++) {
+    for (i = INJECT_EEVM_SCAN_START; i < INJECT_EEVM_SCAN_END; i++) {
+        //
+        // Safety check: ensure we don't exceed maximum stack scan depth
+        //
+        if (i >= INJECT_MAX_STACK_SCAN_DEPTH) {
+            LOG_ERROR(INJECT_ERROR_STACK_INDEX_OUT_OF_RANGE,
+                     "Stack scan index 0x%x exceeds maximum depth 0x%x",
+                     i, INJECT_MAX_STACK_SCAN_DEPTH);
+            status = EFI_INVALID_PARAMETER;
+            LOG_FUNCTION_EXIT(status);
+            return status;
+        }
         //
         // Check if this looks like a kernel address (high canonical address)
         //
@@ -336,6 +348,17 @@ CalculateKernelFunctionAddresses(
 
     LOG_ADDRESS(LOG_LEVEL_INFO, "printk", Context->KernelFuncs.Printk);
     LOG_VERBOSE("printk address validated: 0x%llx", (UINT64)Context->KernelFuncs.Printk);
+
+    //
+    // Validate nested KernelConfig pointer before dereferencing
+    //
+    if (Context->Config->KernelConfig == NULL) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "KernelConfig is NULL in context configuration");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
 
     //
     // Use kernel configuration to calculate other function addresses
@@ -797,9 +820,42 @@ FindRestInitCompleteCall(
     // Find the complete(&kthreadd_done) call in rest_init
     // Use kernel configuration for the offset
     //
-    cp = Context->InitFuncs.RestInit + Context->Config->KernelConfig->RestInitToCompleteOffset;
+    // CRITICAL: Validate offset is reasonable before use
+    //
+    UINT32 CompleteOffset = Context->Config->KernelConfig->RestInitToCompleteOffset;
+    if (CompleteOffset > INJECT_MAX_FUNCTION_SIZE) {
+        LOG_ERROR(INJECT_ERROR_CONFIG_OFFSET_INVALID,
+                 "RestInitToCompleteOffset 0x%x exceeds maximum function size %d",
+                 CompleteOffset, INJECT_MAX_FUNCTION_SIZE);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    cp = Context->InitFuncs.RestInit + CompleteOffset;
+
+    // Validate computed pointer is still in kernel range
+    if ((UINT64)cp < INJECT_MIN_KERNEL_ADDRESS) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Computed complete() address 0x%llx below kernel minimum",
+                 (UINT64)cp);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    // Validate pointer is still within reasonable range of rest_init
+    if ((UINT64)cp >= (UINT64)Context->InitFuncs.RestInit + INJECT_MAX_FUNCTION_SIZE) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Computed complete() address 0x%llx exceeds rest_init bounds",
+                 (UINT64)cp);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
     LOG_DEBUG("Looking for complete() call at rest_init+0x%x (0x%llx)",
-             Context->Config->KernelConfig->RestInitToCompleteOffset, (UINT64)cp);
+             CompleteOffset, (UINT64)cp);
 
     //
     // Verify this is a call instruction
@@ -807,7 +863,7 @@ FindRestInitCompleteCall(
     if (*cp != 0xe8) {
         LOG_ERROR(INJECT_ERROR_COMPLETE_INVALID_INSN,
                  "Expected call instruction (0xe8) at rest_init+0x%x, found 0x%x",
-                 Context->Config->KernelConfig->RestInitToCompleteOffset, *cp);
+                 CompleteOffset, *cp);
         status = EFI_NOT_FOUND;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -1089,9 +1145,9 @@ VirtMemCallback(
 	LOG_INFO("Step 1: Finding efi_enter_virtual_mode return address");
 	efiStatus = FindEfiEnterVirtualModeReturnAddr(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
-		LOG_ERROR(INJECT_ERROR_EEVM_NOT_FOUND, "Step 1 FAILED - Aborting injection");
+		LOG_ERROR(INJECT_ERROR_EEVM_NOT_FOUND, "Step 1 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_EEVM_FOUND);
 	LOG_INFO("Step 1: SUCCESS");
@@ -1104,7 +1160,7 @@ VirtMemCallback(
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PRINTK_CALC_FAILED, "Step 2 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_ADDRESSES_CALCULATED);
 	LOG_INFO("Step 2: SUCCESS");
@@ -1117,7 +1173,7 @@ VirtMemCallback(
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED, "Step 3 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_PATCH1_INSTALLED);
 	LOG_INFO("Step 3: SUCCESS");
@@ -1128,9 +1184,9 @@ VirtMemCallback(
 	LOG_INFO("Step 4: Finding arch_call_rest_init");
 	efiStatus = FindArchCallRestInit(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
-		LOG_ERROR(INJECT_ERROR_ARCH_CALL_REST_INIT_INVALID, "Step 4 FAILED - Aborting injection");
+		LOG_ERROR(INJECT_ERROR_ARCH_CALL_REST_INIT_INVALID, "Step 4 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_ARCH_CALL_FOUND);
 	LOG_INFO("Step 4: SUCCESS");
@@ -1141,9 +1197,9 @@ VirtMemCallback(
 	LOG_INFO("Step 5: Finding rest_init and complete() call");
 	efiStatus = FindRestInitCompleteCall(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
-		LOG_ERROR(INJECT_ERROR_REST_INIT_NOT_FOUND, "Step 5 FAILED - Aborting injection");
+		LOG_ERROR(INJECT_ERROR_REST_INIT_NOT_FOUND, "Step 5 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_REST_INIT_FOUND);
 	LOG_INFO("Step 5: SUCCESS");
@@ -1156,7 +1212,7 @@ VirtMemCallback(
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PATCH2_INSTALL_FAILED, "Step 6 FAILED: %r", efiStatus);
 		injectContext.LastError = efiStatus;
-		return;
+		goto cleanup;
 	}
 	MarkStepCompleted(&injectContext, INJECT_STEP_PATCH2_INSTALLED);
 	LOG_INFO("Step 6: SUCCESS");
@@ -1168,6 +1224,26 @@ VirtMemCallback(
 	LOG_INFO("ALL PATCHES INSTALLED SUCCESSFULLY!");
 	LOG_INFO("Injection Complete - Control Returning to Kernel");
 	LOG_INFO("=================================================");
+	return;
+
+cleanup:
+	//
+	// Cleanup and diagnostic summary on failure
+	//
+	LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+	         "=================================================");
+	LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+	         "INJECTION FAILED - Partial State Summary:");
+	LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+	         "  Steps Completed: 0x%02x", injectContext.StepsCompleted);
+	LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+	         "  Last Error: %r", injectContext.LastError);
+	LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+	         "=================================================");
+
+	// Note: Cannot safely clean up kernel memory patches once installed
+	// Partial patches will cause kernel to fail, but this is expected
+	return;
 }
 
 EFI_STATUS

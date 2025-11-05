@@ -117,9 +117,21 @@ LogSetLevel(
     IN LOG_LEVEL Level
 )
 {
-    if (Level <= LOG_LEVEL_VERBOSE) {
-        gLogConfig.CurrentLevel = Level;
-        LogMessage(LOG_LEVEL_INFO, "Log level changed to %d", Level);
+    //
+    // Validate Level is a valid enum value
+    //
+    switch(Level) {
+        case LOG_LEVEL_ERROR:
+        case LOG_LEVEL_WARNING:
+        case LOG_LEVEL_INFO:
+        case LOG_LEVEL_DEBUG:
+        case LOG_LEVEL_VERBOSE:
+            gLogConfig.CurrentLevel = Level;
+            LogMessage(LOG_LEVEL_INFO, "Log level changed to %d", Level);
+            break;
+        default:
+            // Invalid log level - ignore silently (can't log an error about logging)
+            break;
     }
 }
 
