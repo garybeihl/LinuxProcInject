@@ -126,4 +126,36 @@ CalculateKernelAddress(
     IN INT64 Offset
 );
 
+/**
+ * Verify pattern match with mask support
+ *
+ * @param Data          Data buffer to check
+ * @param Pattern       Pattern to match
+ * @param Mask          Mask indicating which bytes must match (0xFF) vs ignore (0x00)
+ * @param Size          Size of pattern/mask in bytes
+ * @return TRUE if pattern matches, FALSE otherwise
+ */
+BOOLEAN
+EFIAPI
+VerifyPatternWithMask(
+    IN CONST UINT8* Data,
+    IN CONST UINT8* Pattern,
+    IN CONST UINT8* Mask,
+    IN UINTN Size
+);
+
+/**
+ * Verify if code matches efi_enter_virtual_mode pattern
+ *
+ * @param CodePtr       Pointer to code to verify
+ * @param Config        Kernel configuration containing pattern
+ * @return TRUE if pattern matches, FALSE otherwise
+ */
+BOOLEAN
+EFIAPI
+VerifyEfiEnterVirtualModePattern(
+    IN UINT8* CodePtr,
+    IN CONST KERNEL_OFFSET_CONFIG* Config
+);
+
 #endif // _KERNEL_CONFIG_H_
