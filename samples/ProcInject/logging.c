@@ -166,6 +166,7 @@ LogMessage(
 
     //
     // Add the formatted message
+    // Note: AsciiVSPrint may truncate if buffer is insufficient
     //
     VA_START(Marker, Format);
     MessageLen = AsciiVSPrint(gLogBuffer + PrefixLen,
@@ -175,11 +176,27 @@ LogMessage(
     VA_END(Marker);
 
     //
-    // Ensure newline at end
+    // Ensure newline at end and proper null termination
+    // Handle truncation cases
     //
-    if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 2) {
+    if (MessageLen >= sizeof(gLogBuffer) - PrefixLen) {
+        // Message was truncated - ensure null termination and add newline if space
+        if (sizeof(gLogBuffer) >= 2) {
+            gLogBuffer[sizeof(gLogBuffer) - 2] = '\n';
+            gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
+        } else {
+            gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
+        }
+    } else if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 2) {
+        // Normal case - room for newline and null terminator
         gLogBuffer[PrefixLen + MessageLen] = '\n';
         gLogBuffer[PrefixLen + MessageLen + 1] = '\0';
+    } else if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 1) {
+        // Edge case - only room for newline OR null (choose null for safety)
+        gLogBuffer[PrefixLen + MessageLen] = '\0';
+    } else {
+        // Safety - ensure null termination
+        gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
     }
 
     //
@@ -236,6 +253,7 @@ LogError(
 
     //
     // Add the formatted message
+    // Note: AsciiVSPrint may truncate if buffer is insufficient
     //
     VA_START(Marker, Format);
     MessageLen = AsciiVSPrint(gLogBuffer + PrefixLen,
@@ -245,11 +263,27 @@ LogError(
     VA_END(Marker);
 
     //
-    // Ensure newline at end
+    // Ensure newline at end and proper null termination
+    // Handle truncation cases
     //
-    if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 2) {
+    if (MessageLen >= sizeof(gLogBuffer) - PrefixLen) {
+        // Message was truncated - ensure null termination and add newline if space
+        if (sizeof(gLogBuffer) >= 2) {
+            gLogBuffer[sizeof(gLogBuffer) - 2] = '\n';
+            gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
+        } else {
+            gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
+        }
+    } else if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 2) {
+        // Normal case - room for newline and null terminator
         gLogBuffer[PrefixLen + MessageLen] = '\n';
         gLogBuffer[PrefixLen + MessageLen + 1] = '\0';
+    } else if (PrefixLen + MessageLen < sizeof(gLogBuffer) - 1) {
+        // Edge case - only room for newline OR null (choose null for safety)
+        gLogBuffer[PrefixLen + MessageLen] = '\0';
+    } else {
+        // Safety - ensure null termination
+        gLogBuffer[sizeof(gLogBuffer) - 1] = '\0';
     }
 
     //

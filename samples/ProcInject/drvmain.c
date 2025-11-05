@@ -125,7 +125,23 @@ INJECT_CONFIG gInjectConfig;
 // UEFI event handle for SetVirtualAddressMap callback
 EFI_EVENT mVirtMemEvt;
 
-#define PUT_FIXUP(cp, addr) *(INT32*)cp = (INT32)(INT64)(addr - (cp + 4))
+//
+// PUT_FIXUP macro - generates relative call offset for x86-64
+// Validates that the offset fits in INT32 range before writing
+// Returns EFI_INVALID_PARAMETER if offset is out of range
+//
+#define PUT_FIXUP(cp, addr) do { \
+    INT64 FullOffset = (INT64)((UINT64)(addr) - ((UINT64)(cp) + 4)); \
+    if (FullOffset > INT32_MAX || FullOffset < INT32_MIN) { \
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW, \
+                 "Relative call offset %lld out of INT32 range (target: 0x%llx, source: 0x%llx)", \
+                 FullOffset, (UINT64)(addr), (UINT64)(cp)); \
+        status = EFI_INVALID_PARAMETER; \
+        LOG_FUNCTION_EXIT(status); \
+        return status; \
+    } \
+    *(INT32*)(cp) = (INT32)FullOffset; \
+} while(0)
 
 /**
  * Verify if code pointer matches efi_enter_virtual_mode return address
@@ -203,6 +219,16 @@ FindEfiEnterVirtualModeReturnAddr(
             // Verify if this address points to the expected code pattern
             //
             if (VerifyEfiEnterVirtualMode(CandidateAddress)) {
+                //
+                // TOCTOU mitigation: Re-verify the stack value hasn't changed
+                // Between initial read and verification, the stack could have been modified
+                //
+                if ((UINT64)Rsp[i] != (UINT64)CandidateAddress) {
+                    LOG_WARNING("Stack entry at index 0x%x changed between scan and verification (was 0x%llx, now 0x%llx)",
+                               i, (UINT64)CandidateAddress, (UINT64)Rsp[i]);
+                    continue;  // Try next stack entry
+                }
+
                 //
                 // Store results in context
                 //
@@ -454,16 +480,43 @@ InstallPatch1_PrintkBanner(
     //
     // Copy the printk call template
     //
-    for (j = 0; j < sizeof(printk_banner_template); j++) {
-        DestinationPointer[i + j] = printk_banner_template[j];
+    UINTN BannerSize = sizeof(banner);
+    UINTN TemplateSize = sizeof(printk_banner_template);
+    UINTN TotalSize = BannerSize + TemplateSize;
+
+    // Validate total size doesn't exceed available space before EEVM return address
+    if ((UINT64)DestinationPointer + TotalSize > (UINT64)EevmReturnAddr) {
+        LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED,
+                 "Patch 1 total size %d exceeds available space before EEVM return address",
+                 TotalSize);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
-    LOG_VERBOSE("Copied printk template (%d bytes)", sizeof(printk_banner_template));
+
+    for (j = 0; j < TemplateSize; j++) {
+        DestinationPointer[BannerSize + j] = printk_banner_template[j];
+    }
+    LOG_VERBOSE("Copied printk template (%d bytes)", TemplateSize);
 
     //
     // Fix up the addresses in the patched code
     // 1. mov rdi, Message1 (pointer to banner string)
+    // Note: mov rdi, imm32 sign-extends the 32-bit immediate to 64-bit
+    // This works for kernel addresses in range 0xFFFFFFFF80000000 - 0xFFFFFFFFFFFFFFFF
     //
-    cp = DestinationPointer + (sizeof(banner) + 4);
+    cp = DestinationPointer + (BannerSize + 4);
+
+    // Validate DestinationPointer is in valid sign-extension range for imm32
+    if ((UINT64)DestinationPointer < 0xFFFFFFFF80000000ULL) {
+        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                 "Banner address 0x%llx cannot be encoded as sign-extended imm32",
+                 (UINT64)DestinationPointer);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
     *(INT32*)cp = (INT32)(INT64)DestinationPointer;
     LOG_VERBOSE("Fixed up banner address");
 
@@ -589,9 +642,28 @@ FindArchCallRestInit(
 
                 //
                 // Skip over remaining call instructions until we find mfence
+                // Limit scan to prevent unbounded loop
                 //
-                while (*cp == 0xe8) {
+                UINTN CallsScanned = 0;
+                while (*cp == 0xe8 && CallsScanned < INJECT_MAX_CALL_SCAN_BYTES / 5) {
                     cp += 5;
+                    CallsScanned++;
+
+                    // Validate cp is still in kernel range
+                    if ((UINT64)cp < INJECT_MIN_KERNEL_ADDRESS) {
+                        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                                 "cp out of bounds during call scan");
+                        status = EFI_INVALID_PARAMETER;
+                        LOG_FUNCTION_EXIT(status);
+                        return status;
+                    }
+                }
+
+                // Warn if we hit the scan limit
+                if (CallsScanned >= INJECT_MAX_CALL_SCAN_BYTES / 5) {
+                    LOG_ERROR(INJECT_ERROR_START_KERNEL_NOT_FOUND,
+                             "Call scan limit reached (%d calls scanned)", CallsScanned);
+                    continue;  // Try next candidate
                 }
 
                 //
@@ -602,8 +674,29 @@ FindArchCallRestInit(
                     // Back up to the last call instruction (arch_call_rest_init)
                     //
                     cp -= 4;  // Point to offset within call instruction
+
+                    // Validate cp is still in kernel range after backward navigation
+                    if ((UINT64)cp < INJECT_MIN_KERNEL_ADDRESS) {
+                        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                                 "cp underflowed to non-kernel address 0x%llx after backward navigation",
+                                 (UINT64)cp);
+                        status = EFI_INVALID_PARAMETER;
+                        LOG_FUNCTION_EXIT(status);
+                        return status;
+                    }
+
                     offset = *(INT32*)cp;
                     Context->InitFuncs.ArchCallRestInit = (cp + 4) + offset;
+
+                    // Validate computed address is in kernel range
+                    if ((UINT64)Context->InitFuncs.ArchCallRestInit < INJECT_MIN_KERNEL_ADDRESS) {
+                        LOG_ERROR(INJECT_ERROR_ADDRESS_OUT_OF_RANGE,
+                                 "arch_call_rest_init address 0x%llx below kernel minimum",
+                                 (UINT64)Context->InitFuncs.ArchCallRestInit);
+                        status = EFI_INVALID_PARAMETER;
+                        LOG_FUNCTION_EXIT(status);
+                        return status;
+                    }
 
                     LOG_INFO("Found start_kernel return address: 0x%llx", Context->Stack.StartKernelRetAddr);
                     LOG_ADDRESS(LOG_LEVEL_INFO, "arch_call_rest_init", Context->InitFuncs.ArchCallRestInit);
@@ -809,6 +902,18 @@ InstallPatch2_KthreadCreate(
     //
     // Calculate proc_template location (before Patch2)
     //
+    // CRITICAL: Check for underflow BEFORE arithmetic
+    // Ensure the sum of sizes doesn't exceed available space
+    if (sizeof(patch_code_2) + sizeof(proc_template) >
+        ((UINT64)StartKernelRetAddr - INJECT_MIN_KERNEL_ADDRESS)) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "Patch2 size (%d) + proc_template size (%d) too large for available space",
+                 sizeof(patch_code_2), sizeof(proc_template));
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
     cp = StartKernelRetAddr - (sizeof(patch_code_2) + sizeof(proc_template));
     LOG_DEBUG("proc_template will be at: 0x%llx", (UINT64)cp);
 
@@ -837,11 +942,34 @@ InstallPatch2_KthreadCreate(
                (UINT64)cp, (UINT64)Patch2);
 
     //
+    // Verify no overlap between write regions
+    // proc_template write: [cp ... cp + sizeof(proc_template)]
+    // Patch2 write: [Patch2 ... Patch2 + sizeof(patch_code_2)]
+    //
+    UINT8* ProcTemplateEnd = cp + sizeof(proc_template);
+    if ((UINT64)ProcTemplateEnd > (UINT64)Patch2) {
+        LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                 "proc_template write region [0x%llx - 0x%llx] overlaps with Patch2 at 0x%llx",
+                 (UINT64)cp, (UINT64)ProcTemplateEnd, (UINT64)Patch2);
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    //
     // Write the proc_template (thread code + data) immediately before Patch2
     // This goes in already-executed init code that will be reclaimed
     //
     for (i = 0; i < sizeof(proc_template); i++) {
-        *cp++ = proc_template[i];
+        // Bounds check during copy for extra safety
+        if ((UINT64)(cp + i) >= (UINT64)Patch2) {
+            LOG_ERROR(INJECT_ERROR_POINTER_OVERFLOW,
+                     "proc_template copy exceeded bounds at offset %d", i);
+            status = EFI_INVALID_PARAMETER;
+            LOG_FUNCTION_EXIT(status);
+            return status;
+        }
+        cp[i] = proc_template[i];
     }
     LOG_VERBOSE("Copied proc_template (%d bytes)", sizeof(proc_template));
 

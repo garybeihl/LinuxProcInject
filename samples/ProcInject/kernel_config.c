@@ -1,4 +1,6 @@
 #include "kernel_config.h"
+#include "inject_context.h"
+#include "logging.h"
 #include <Library/BaseLib.h>
 #include <Library/DebugLib.h>
 
@@ -260,8 +262,26 @@ VerifyEfiEnterVirtualModePattern(
     // Additionally verify the error string to be more confident
     // The mov rdi instruction at offset 0x0b contains a pointer to the error string
     //
+
+    // Validate we can safely read the offset at CodePtr + 0x0b
+    if ((UINT64)(CodePtr + 0x0b) < INJECT_MIN_KERNEL_ADDRESS) {
+        return FALSE;
+    }
+
     StringPtr = (UINT64)(INT64)*(INT32*)(CodePtr + 0x0b);
     StringPtr += 2;  // Adjust for instruction encoding
+
+    // Validate the computed string pointer is in kernel address range
+    if (StringPtr < INJECT_MIN_KERNEL_ADDRESS) {
+        return FALSE;
+    }
+
+    // Validate string pointer is reasonable (not too far from code)
+    // Kernel .rodata typically within 2GB of code
+    if (StringPtr > (UINT64)CodePtr + 0x80000000ULL ||
+        StringPtr < (UINT64)CodePtr - 0x80000000ULL) {
+        return FALSE;
+    }
 
     if (AsciiStrCmp((CHAR8*)StringPtr,
                     "efi: Unable to switch EFI into virtual mode (status=%lx)!\n") != 0) {
