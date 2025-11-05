@@ -1,5 +1,6 @@
 #include "drv.h"
 #include "kernel_config.h"
+#include "logging.h"
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeLib.h>
 
@@ -176,10 +177,19 @@ FindEfiEnterVirtualModeReturnAddr(
 {
     UINTN i;
     UINT8* candidateAddr;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (Rsp == NULL || ReturnAddress == NULL || ReturnIndex == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameters to FindEfiEnterVirtualModeReturnAddr");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
+
+    LOG_DEBUG("Scanning stack for efi_enter_virtual_mode return address (0x28 - 0x48)");
 
     //
     // Search for the return address into efi_enter_virtual_mode
@@ -191,6 +201,7 @@ FindEfiEnterVirtualModeReturnAddr(
         //
         if ((Rsp[i] & 0xFFFFFFFF00000000L) == 0xFFFFFFFF00000000L) {
             candidateAddr = (UINT8*)Rsp[i];
+            LOG_VERBOSE("Checking stack[0x%x] = 0x%llx", i, candidateAddr);
 
             //
             // Verify if this address points to the expected code pattern
@@ -199,21 +210,22 @@ FindEfiEnterVirtualModeReturnAddr(
                 *ReturnAddress = candidateAddr;
                 *ReturnIndex = i;
 
-                AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-                           "Found efi_enter_virtual_mode return addr @ 0x%llx!\n",
-                           candidateAddr);
-                SerialOutString(StrBuffer);
+                LOG_INFO("Found efi_enter_virtual_mode return address: 0x%llx (stack index 0x%x)",
+                        candidateAddr, i);
 
-                return EFI_SUCCESS;
+                status = EFI_SUCCESS;
+                LOG_FUNCTION_EXIT(status);
+                return status;
             }
         }
     }
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-               "Did NOT find efi_enter_virtual_mode return addr\n");
-    SerialOutString(StrBuffer);
+    LOG_ERROR(INJECT_ERROR_EEVM_NOT_FOUND,
+             "efi_enter_virtual_mode return address not found in stack range");
 
-    return EFI_NOT_FOUND;
+    status = EFI_NOT_FOUND;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -232,9 +244,16 @@ CalculateKernelFunctionAddresses(
 {
     INT32 offset;
     UINT8* cp;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (EevmReturnAddr == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameter to CalculateKernelFunctionAddresses");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
 
     //
@@ -243,36 +262,33 @@ CalculateKernelFunctionAddresses(
     //
     offset = *(INT32*)(EevmReturnAddr + 0x10);
     printk = (EevmReturnAddr + 0x14) + offset;
+    LOG_ADDRESS(LOG_LEVEL_INFO, "printk", printk);
 
     //
     // Use kernel configuration to calculate other function addresses
     //
     __kmalloc = CalculateKernelAddress(printk,
                                        gInjectConfig.KernelConfig->PrintkToKmalloc);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "__kmalloc", __kmalloc);
+
     msleep = CalculateKernelAddress(printk,
                                     gInjectConfig.KernelConfig->PrintkToMsleep);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "msleep", msleep);
+
     kthread_create_on_node = CalculateKernelAddress(printk,
                                                     gInjectConfig.KernelConfig->PrintkToKthreadCreateOnNode);
+    LOG_ADDRESS(LOG_LEVEL_DEBUG, "kthread_create_on_node", kthread_create_on_node);
 
     //
     // Fix up the msleep call in our kthread code template
     //
     cp = &proc_template[17];
     *(UINT64*)cp = (UINT64)msleep;
+    LOG_DEBUG("Fixed up msleep call in proc_template");
 
-    //
-    // Log the discovered addresses
-    //
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Kernel: %a\n",
-               gInjectConfig.KernelConfig->VersionString);
-    SerialOutString(StrBuffer);
-
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer),
-               "printk = 0x%llx, __kmalloc = 0x%llx, msleep = 0x%llx, kthread_create_on_node = 0x%llx\n",
-               printk, __kmalloc, msleep, kthread_create_on_node);
-    SerialOutString(StrBuffer);
-
-    return EFI_SUCCESS;
+    status = EFI_SUCCESS;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -296,9 +312,16 @@ InstallPatch1_PrintkBanner(
 {
     UINTN i, j;
     UINT8* cp;
+    EFI_STATUS status;
+
+    LOG_FUNCTION_ENTRY();
 
     if (Rsp == NULL || EevmReturnAddr == NULL) {
-        return EFI_INVALID_PARAMETER;
+        LOG_ERROR(INJECT_ERROR_INVALID_PARAMETER,
+                 "Invalid parameters to InstallPatch1_PrintkBanner");
+        status = EFI_INVALID_PARAMETER;
+        LOG_FUNCTION_EXIT(status);
+        return status;
     }
 
     //
@@ -306,6 +329,7 @@ InstallPatch1_PrintkBanner(
     // We write immediately before the return address in already-executed code
     //
     destptr = EevmReturnAddr - (sizeof(banner) + sizeof(printk_banner_template));
+    LOG_DEBUG("Patch 1 destination: 0x%llx", destptr);
 
     //
     // Copy the banner string
@@ -313,6 +337,7 @@ InstallPatch1_PrintkBanner(
     for (i = 0; i < sizeof(banner); i++) {
         destptr[i] = banner[i];
     }
+    LOG_VERBOSE("Copied banner string (%d bytes)", sizeof(banner));
 
     //
     // Copy the printk call template
@@ -320,6 +345,7 @@ InstallPatch1_PrintkBanner(
     for (j = 0; j < sizeof(printk_banner_template); j++) {
         destptr[i + j] = printk_banner_template[j];
     }
+    LOG_VERBOSE("Copied printk template (%d bytes)", sizeof(printk_banner_template));
 
     //
     // Fix up the addresses in the patched code
@@ -327,22 +353,26 @@ InstallPatch1_PrintkBanner(
     //
     cp = destptr + (sizeof(banner) + 4);
     *(INT32*)cp = (INT32)(INT64)destptr;
+    LOG_VERBOSE("Fixed up banner address");
 
     //
     // 2. call printk (relative call)
     //
     cp += (4 + 1);
     PUT_FIXUP(cp, printk);
+    LOG_VERBOSE("Fixed up printk call");
 
     //
     // Modify the stack return address to point to our patched code
     //
     Rsp[ReturnIndex] = (UINT64)(destptr + sizeof(banner));
+    LOG_DEBUG("Modified stack return address to 0x%llx", Rsp[ReturnIndex]);
 
-    AsciiSPrint(StrBuffer, sizeof(StrBuffer), "Patch 1 installed @ 0x%llx\n", destptr);
-    SerialOutString(StrBuffer);
+    LOG_INFO("Patch 1 installed successfully at 0x%llx", destptr);
 
-    return EFI_SUCCESS;
+    status = EFI_SUCCESS;
+    LOG_FUNCTION_EXIT(status);
+    return status;
 }
 
 /**
@@ -740,13 +770,28 @@ UefiMain (
     EFI_STATUS efiStatus;
 
     //
+    // Initialize logging system
+    // Use DEBUG level for development, INFO for production
+    //
+    LogInitialize(LOG_LEVEL_DEBUG);
+
+    LOG_INFO("=================================================");
+    LOG_INFO("ProcInject v0.7 Starting");
+    LOG_INFO("=================================================");
+
+    //
     // Initialize kernel configuration
     //
     efiStatus = InitializeKernelConfig(&gInjectConfig);
     if (EFI_ERROR(efiStatus)) {
+        LOG_ERROR(INJECT_ERROR_CONFIG_INVALID,
+                 "Failed to initialize kernel configuration: %r", efiStatus);
         Print(L"Failed to initialize kernel configuration: %r\n", efiStatus);
         return efiStatus;
     }
+
+    LOG_INFO("Kernel target: %a", gInjectConfig.KernelConfig->VersionString);
+    LOG_INFO("VirtualMemCallback address: 0x%llx", (UINT64)VirtMemCallback);
 
     Print(L"ProcInject v0.7 - Kernel target: %a\n", gInjectConfig.KernelConfig->VersionString);
     Print(L"VirtualMemCallback = 0x%llx...\n", (UINT64)VirtMemCallback);

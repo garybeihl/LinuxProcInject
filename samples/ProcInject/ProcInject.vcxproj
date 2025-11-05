@@ -29,11 +29,13 @@
       <Optimization Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Disabled</Optimization>
     </ClCompile>
     <ClCompile Include="kernel_config.c" />
+    <ClCompile Include="logging.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="drv.h" />
     <ClInclude Include="drvproto.h" />
     <ClInclude Include="kernel_config.h" />
+    <ClInclude Include="logging.h" />
   </ItemGroup>
   <ItemGroup>
     <NASM Include="drvasm.nasm" />
